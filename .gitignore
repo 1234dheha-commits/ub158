@@ -1,0 +1,18 @@
+# СЕКРЕТЫ — НИКОГДА не коммитить (session = полный доступ к аккаунту)
+*.session
+*.session-journal
+session.session*
+.session_string.tmp
+.env
+.deploy-secrets.env
+
+# Состояние рантайма
+kick_state.json
+autoclean_state.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/

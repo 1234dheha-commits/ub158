@@ -1,0 +1,6 @@
+telethon>=1.40.0
+Pillow>=10.0.0
+python-dotenv
+faster-whisper
+tzdata
+psycopg2-binary
