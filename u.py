@@ -374,6 +374,13 @@ async def autoclean_loop():
             await asyncio.sleep(min(wait, 3600))  # Проверяем каждый час
             continue
 
+        # Нет каналов — чистить нечего. Не гоняем цикл и не спамим: ждём час
+        # и проверяем снова. Таймер НЕ сбрасываем, чтобы как только канал
+        # появится, очистка прошла сразу.
+        if not monitored_channels:
+            await asyncio.sleep(3600)
+            continue
+
         print('🔄 Начинается автоочистка комментариев...')
         total = 0
         channels_snapshot = list(monitored_channels)
@@ -1123,9 +1130,12 @@ async def list_channels(event):
 # РУЧНАЯ ОЧИСТКА КОММЕНТОВ
 # ═══════════════════════════════════════════════════════════════════════════
 
-@client.on(events.NewMessage(outgoing=True, pattern=r'^\.clean$'))
+@client.on(events.NewMessage(outgoing=True, pattern=r'^\.cle(?:an|ar)$'))
 async def manual_clean_all(event):
-    """Удаляет все мои комментарии во всех каналах (ТОЛЬКО OWNER)."""
+    """Принудительно удаляет все мои комментарии во всех каналах.
+
+    Команды-синонимы: .clean и .clear (ТОЛЬКО OWNER).
+    """
     if event.sender_id != OWNER_ID:
         await event.delete()
         return
@@ -1148,9 +1158,9 @@ async def manual_clean_all(event):
     final = await loading.edit(f'✅ Очистка завершена\n💬 Удалено: {total} комментариев')
     asyncio.create_task(_delete_after(final, 30))
 
-@client.on(events.NewMessage(outgoing=True, pattern=r'^\.clean (-?\d+)$'))
+@client.on(events.NewMessage(outgoing=True, pattern=r'^\.cle(?:an|ar) (-?\d+)$'))
 async def manual_clean_one(event):
-    """Удаляет все мои комментарии в одном канале (ТОЛЬКО OWNER)."""
+    """Удаляет все мои комментарии в одном канале — .clean/.clear <ID> (OWNER)."""
     if event.sender_id != OWNER_ID:
         await event.delete()
         return
@@ -1395,8 +1405,8 @@ async def cmd_help(event):
         "  .remove <ID>       удалить канал\n"
         "  .list              показать список каналов\n\n"
         "💬 КОММЕНТАРИИ:\n"
-        "  .clean             удалить ВСЕ мои комменты везде\n"
-        "  .clean <ID>        удалить в одном канале\n\n"
+        "  .clean / .clear    принудительно удалить ВСЕ мои комменты везде\n"
+        "  .clean/.clear <ID> удалить в одном канале\n\n"
         "🗑️  УДАЛЕНИЕ СООБЩЕНИЙ:\n"
         "  .delall            удалить все мои сообщения в чате\n"
         "  .delall <ID>       удалить в другом чате\n"
