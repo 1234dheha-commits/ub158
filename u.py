@@ -1090,31 +1090,67 @@ async def add_channel(event):
     await asyncio.sleep(5)
     await event.delete()
 
-@client.on(events.NewMessage(outgoing=True, pattern=r'^\.remove (.+)$'))
-async def remove_channel(event):
-    """Удаляет канал из списка отслеживания (ТОЛЬКО OWNER)."""
-    if event.sender_id != OWNER_ID:
-        await event.delete()
-        return
-    raw = event.pattern_match.group(1).strip()
-    # .remove <N> — убрать по номеру из .list (ID каналов огромные, поэтому
-    # маленькое число 1..len — это номер позиции, а не ID).
-    if raw.isdigit() and 1 <= int(raw) <= len(monitored_channels):
-        cid = monitored_channels[int(raw) - 1]
+async def _remove_monitored(event, cid, title=None):
+    """Убирает канал из списка и БД, отчитывается, чистит сообщение."""
+    if title is None:
         title = str(cid)
         try:
             ent = await client.get_entity(cid)
             title = getattr(ent, 'title', None) or title
         except Exception:
             pass
-        remove_channel_db(cid)
-        if cid in monitored_channels:
-            monitored_channels.remove(cid)
-        await event.edit(f'✅ Убран: {title}\nID: {cid}')
-        await asyncio.sleep(5)
+    remove_channel_db(cid)
+    if cid in monitored_channels:
+        monitored_channels.remove(cid)
+    await event.edit(f'✅ Убран: {title}\nID: {cid}')
+    await asyncio.sleep(5)
+    await event.delete()
+
+@client.on(events.NewMessage(outgoing=True, pattern=r'^\.remove (.+)$'))
+async def remove_channel(event):
+    """Убирает канал по номеру, названию или ID/@username (ТОЛЬКО OWNER)."""
+    if event.sender_id != OWNER_ID:
         await event.delete()
         return
-    raw_id = int(raw) if re.fullmatch(r'-?\d+', raw) else None
+    raw = event.pattern_match.group(1).strip()
+
+    # 1) .remove <N> — по номеру из .list (ID каналов огромные, поэтому
+    #    маленькое число 1..len — это номер позиции, а не ID).
+    if raw.isdigit() and 1 <= int(raw) <= len(monitored_channels):
+        await _remove_monitored(event, monitored_channels[int(raw) - 1])
+        return
+
+    # 2) .remove <название> — поиск по названию среди отслеживаемых
+    #    (не число, не @username, не ссылка t.me).
+    is_id_like = bool(re.fullmatch(r'-?\d+', raw))
+    if not is_id_like and not raw.startswith('@') and 't.me/' not in raw:
+        q = raw.casefold()
+        matches = []
+        for cid in list(monitored_channels):
+            try:
+                ent = await client.get_entity(cid)
+                title = getattr(ent, 'title', None)
+            except Exception:
+                title = None
+            if title and q in title.casefold():
+                matches.append((cid, title))
+        if len(matches) == 1:
+            await _remove_monitored(event, matches[0][0], matches[0][1])
+            return
+        if len(matches) > 1:
+            lines = ['🔎 Несколько совпадений — уточни номером:', '']
+            for cid, title in matches:
+                idx = monitored_channels.index(cid) + 1
+                lines.append(f'{idx}. {title}')
+            lines += ['', 'Убрать: .remove <номер>']
+            await event.edit('\n'.join(lines))
+            await asyncio.sleep(20)
+            await event.delete()
+            return
+        # 0 совпадений по названию — пробуем как ID/@username ниже
+
+    # 3) .remove <ID/@username/ссылка> — как раньше
+    raw_id = int(raw) if is_id_like else None
     channel_id = None
     try:
         entity = await _resolve_channel_entity(raw)
@@ -1213,7 +1249,7 @@ async def scan_channels(event):
         '',
         '➕ .addall — добавить ВСЕ',
         '➕ .add <N> — по номеру (напр. .add 3)',
-        '❌ .remove <N> — убрать по номеру (.list)',
+        '❌ .remove <N|название> — убрать',
     ]
     try:
         await loading.edit('\n'.join(lines))
@@ -1597,6 +1633,7 @@ async def cmd_help(event):
         "  .add <N>           добавить по номеру из .scan\n"
         "  .add <ID/@>        добавить по ID или @username\n"
         "  .remove <N>        убрать по номеру из .list\n"
+        "  .remove <название> убрать по названию канала\n"
         "  .remove <ID/@>     убрать по ID или @username\n"
         "  .list              показать список каналов\n\n"
         "💬 КОММЕНТАРИИ:\n"
