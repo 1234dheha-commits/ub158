@@ -22,9 +22,9 @@ from telethon.tl.types import ChatBannedRights, MessageEntityCustomEmoji, PeerCh
 import psycopg2
 from concurrent.futures import ThreadPoolExecutor
 
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 # ПОДАВЛЯЕМ СПАМ ЛОГОВ TELETHON
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 
 logging.getLogger('telethon.client.updates').setLevel(logging.CRITICAL)
 logging.getLogger('telethon').setLevel(logging.ERROR)
@@ -33,9 +33,9 @@ logging.getLogger('telethon.client.telegrambaseclient').setLevel(logging.ERROR)
 
 load_dotenv()
 
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 # КОНСТАНТЫ И КОНФИГУРАЦИЯ
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 
 try:
     from PIL import Image
@@ -58,7 +58,7 @@ DELALL_EMOJI_ID = 5219901967916084166
 DATABASE_URL = os.getenv('DATABASE_URL')
 GROQ_API_KEY = os.getenv('GROQ_API_KEY', '')
 
-# ── Локальная транскрибация (faster-whisper, бесплатно, без API) ──────────────
+# Локальная транскрибация (faster-whisper, бесплатно, без API) 
 # Ограничиваем потоки CPU-математики до загрузки faster-whisper — иначе
 # CTranslate2/OpenMP резервируют пул потоков на каждое ядро, что на контейнере
 # с 512MB приводит к OOM.
@@ -74,12 +74,12 @@ try:
     from faster_whisper import WhisperModel as _WhisperModel
     _whisper_executor = ThreadPoolExecutor(max_workers=1)
     WHISPER_AVAILABLE = True
-    print(f'✅ faster-whisper подключён (модель «{WHISPER_MODEL_NAME}» загрузится при первом гс)')
+    print(f'faster-whisper подключён (модель «{WHISPER_MODEL_NAME}» загрузится при первом гс)')
 except Exception as _e:
     _WhisperModel = None
     _whisper_executor = None
     WHISPER_AVAILABLE = False
-    print(f'⚠ faster-whisper недоступен: {_e}\n   Установи: pip install faster-whisper')
+    print(f'faster-whisper недоступен: {_e}\n   Установи: pip install faster-whisper')
 
 def _get_whisper_model():
     """Лениво создаёт модель Whisper при первом обращении (экономия памяти)."""
@@ -92,7 +92,7 @@ def _get_whisper_model():
             cpu_threads=1,
             num_workers=1,
         )
-        print(f'✅ faster-whisper модель «{WHISPER_MODEL_NAME}» загружена')
+        print(f'faster-whisper модель «{WHISPER_MODEL_NAME}» загружена')
     return _whisper_model
 
 # Интервал автоочистки комментариев — 3 дня
@@ -115,9 +115,9 @@ COMMENTS = [
     'остров моргенштерна'
 ]
 
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 # ИНИЦИАЛИЗАЦИЯ АРГУМЕНТОВ И СЕССИИ
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 
 parser = argparse.ArgumentParser(description='Telegram UserBot для автокомментариев')
 parser.add_argument('--reset-session', action='store_true', 
@@ -139,15 +139,15 @@ def _remove_session_files():
         if os.path.exists(f):
             try:
                 os.remove(f)
-                print(f'✓ Удалён {f}')
+                print(f'Удалён {f}')
             except OSError as e:
-                print(f'✗ Не удалось удалить {f}: {e}')
+                print(f'Не удалось удалить {f}: {e}')
                 return False
     return True
 
 if args.reset_session:
     if _remove_session_files():
-        print('✓ Сессия сброшена. Введите код из Telegram при следующем запуске.')
+        print('Сессия сброшена. Введите код из Telegram при следующем запуске.')
     else:
         sys.exit(1)
 
@@ -165,7 +165,7 @@ try:
     )
 except sqlite3.OperationalError as e:
     if 'version' in str(e).lower():
-        print(f'⚠ Файл сессии устарел. Пересоздаю... ({e})')
+        print(f'Файл сессии устарел. Пересоздаю... ({e})')
         _remove_session_files()
         client = TelegramClient(
             session_name,
@@ -180,9 +180,9 @@ except sqlite3.OperationalError as e:
     else:
         raise
 
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 # ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ СОСТОЯНИЯ
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 
 monitored_channels = []
 _channel_no_discussion_cache = set()
@@ -209,9 +209,9 @@ auto_delete_worker_map = {}
 
 autoclean_task = None
 
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 # БАЗА ДАННЫХ
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 
 def get_db_connection():
     """Получает соединение с PostgreSQL."""
@@ -234,7 +234,7 @@ def init_db():
         ''')
         conn.commit()
     except Exception as e:
-        print(f'❌ DB init error: {e}')
+        print(f'DB init error: {e}')
         conn.rollback()
     finally:
         cur.close()
@@ -250,7 +250,7 @@ def load_channels():
         cur.execute('SELECT channel_id FROM channels')
         return [row[0] for row in cur.fetchall()]
     except Exception as e:
-        print(f'❌ Load channels error: {e}')
+        print(f'Load channels error: {e}')
         return []
     finally:
         cur.close()
@@ -267,7 +267,7 @@ def add_channel_db(channel_id):
         conn.commit()
         return True
     except Exception as e:
-        print(f'❌ Add channel error: {e}')
+        print(f'Add channel error: {e}')
         conn.rollback()
         return False
     finally:
@@ -287,7 +287,7 @@ def remove_channel_db(channel_id):
         conn.commit()
         return deleted
     except Exception as e:
-        print(f'❌ Remove channel error: {e}')
+        print(f'Remove channel error: {e}')
         conn.rollback()
         return False
     finally:
@@ -295,9 +295,9 @@ def remove_channel_db(channel_id):
             cur.close()
         conn.close()
 
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 # АВТООЧИСТКА КОММЕНТАРИЕВ
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 
 def load_autoclean_state():
     """Загружает время последней автоочистки."""
@@ -363,7 +363,7 @@ async def _delete_my_comments_in_channel(channel_id):
             except Exception:
                 pass
     except Exception as e:
-        print(f'❌ Ошибка очистки {channel_id}: {e}')
+        print(f'Ошибка очистки {channel_id}: {e}')
     return deleted_count
 
 async def autoclean_loop():
@@ -385,7 +385,7 @@ async def autoclean_loop():
             await asyncio.sleep(3600)
             continue
 
-        print('🔄 Начинается автоочистка комментариев...')
+        print('Начинается автоочистка комментариев...')
         total = 0
         channels_snapshot = list(monitored_channels)
         for cid in channels_snapshot:
@@ -395,16 +395,16 @@ async def autoclean_loop():
 
         last_clean = time.time()
         save_autoclean_state(last_clean)
-        print(f'✅ Автоочистка завершена. Удалено: {total} комментариев')
+        print(f'Автоочистка завершена. Удалено: {total} комментариев')
 
         try:
-            await client.send_message(OWNER_ID, f'✅ Автоочистка завершена\nУдалено комментариев: {total}')
+            await client.send_message(OWNER_ID, f'Автоочистка завершена\nУдалено комментариев: {total}')
         except Exception:
             pass
 
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 
 async def _delete_after(message, delay):
     """Удаляет сообщение через delay секунд."""
@@ -472,9 +472,9 @@ async def _delete_user_messages_if_needed(chat, target, ban_future):
     except Exception:
         pass
 
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 # ФОРМАТИРОВАНИЕ И ЭМОДЗИ
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 
 def _custom_emoji_prefix(doc_id, text):
     """Добавляет кастомный эмодзи в начало текста."""
@@ -512,9 +512,9 @@ def clean(t):
             lines.append(i)
     return '\n'.join(lines).strip()
 
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 # УПРАВЛЕНИЕ СЕССИЯМИ (АВТОКИК)
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 
 async def load_kick_state():
     """Загружает состояние автокика."""
@@ -570,13 +570,13 @@ async def monitor_sessions():
                             await client(functions.account.ResetAuthorizationRequest(hash=nh))
                             info = next((a for a in auths if a["hash"] == nh), {})
                             device = info.get("device", "Unknown")
-                            msg = f"🚫 Сессия заблокирована\nhash={nh}\ndevice={device}"
+                            msg = f"Сессия заблокирована\nhash={nh}\ndevice={device}"
                             await client.send_message(OWNER_ID, msg)
                         except errors.FloodWaitError as e:
                             await asyncio.sleep(max(e.seconds, 5))
                         except Exception as e:
                             try:
-                                await client.send_message(OWNER_ID, f"❌ Ошибка при кике {nh}: {e}")
+                                await client.send_message(OWNER_ID, f"Ошибка при кике {nh}: {e}")
                             except Exception:
                                 pass
                 await asyncio.sleep(0.9)
@@ -594,9 +594,9 @@ async def cmd_enable(event):
         return
     global kick_enabled, monitor_task, baseline_hashes
     if kick_enabled:
-        await event.reply("✅ Автокик уже включен")
+        await event.reply("Автокик уже включен")
         return
-    loading = await event.reply("🔄 Включаю автокик...")
+    loading = await event.reply("Включаю автокик...")
     try:
         if not client.is_connected():
             await client.connect()
@@ -606,10 +606,10 @@ async def cmd_enable(event):
         if monitor_task is None or monitor_task.done():
             monitor_task = asyncio.create_task(monitor_sessions())
         await save_kick_state()
-        await loading.edit("✅ Автокик включен")
+        await loading.edit("Автокик включен")
         asyncio.create_task(_delete_after(loading, 30))
     except Exception as e:
-        await loading.edit(f"❌ Ошибка: {e}")
+        await loading.edit(f"Ошибка: {e}")
         asyncio.create_task(_delete_after(loading, 30))
 
 @client.on(events.NewMessage(pattern=r'^\.kickf$', outgoing=True))
@@ -619,9 +619,9 @@ async def cmd_disable(event):
         return
     global kick_enabled, monitor_task
     if not kick_enabled:
-        await event.reply("✅ Автокик уже выключен")
+        await event.reply("Автокик уже выключен")
         return
-    loading = await event.reply("🔄 Выключаю автокик...")
+    loading = await event.reply("Выключаю автокик...")
     try:
         kick_enabled = False
         if monitor_task and not monitor_task.done():
@@ -631,10 +631,10 @@ async def cmd_disable(event):
             except asyncio.CancelledError:
                 pass
         await save_kick_state()
-        await loading.edit("✅ Автокик выключен")
+        await loading.edit("Автокик выключен")
         asyncio.create_task(_delete_after(loading, 30))
     except Exception as e:
-        await loading.edit(f"❌ Ошибка: {e}")
+        await loading.edit(f"Ошибка: {e}")
         asyncio.create_task(_delete_after(loading, 30))
 
 @client.on(events.NewMessage(pattern=r'^\.gn$', outgoing=True))
@@ -644,11 +644,11 @@ async def cmd_gs_on(event):
         return
     global gs_enabled
     if gs_enabled:
-        await event.reply("✅ Транскрибация уже включена")
+        await event.reply("Транскрибация уже включена")
         return
     gs_enabled = True
     await save_kick_state()
-    await event.reply("✅ Транскрибация голосовых включена")
+    await event.reply("Транскрибация голосовых включена")
 
 @client.on(events.NewMessage(pattern=r'^\.gf$', outgoing=True))
 async def cmd_gs_off(event):
@@ -657,11 +657,11 @@ async def cmd_gs_off(event):
         return
     global gs_enabled
     if not gs_enabled:
-        await event.reply("✅ Транскрибация уже выключена")
+        await event.reply("Транскрибация уже выключена")
         return
     gs_enabled = False
     await save_kick_state()
-    await event.reply("✅ Транскрибация голосовых выключена")
+    await event.reply("Транскрибация голосовых выключена")
 
 def _transcribe_sync(voice_bytes: bytes) -> str | None:
     """Синхронная транскрибация через faster-whisper (запускается в executor)."""
@@ -692,7 +692,7 @@ def _transcribe_sync(voice_bytes: bytes) -> str | None:
             except Exception:
                 pass
     except Exception as e:
-        print(f'❌ Ошибка транскрибации: {e}')
+        print(f'Ошибка транскрибации: {e}')
         return None
 
 
@@ -731,7 +731,7 @@ async def handle_gs_voice(event):
             await event.respond(quote, parse_mode='html')
         gc.collect()
     except Exception as e:
-        print(f'❌ handle_gs_voice: {e}')
+        print(f'handle_gs_voice: {e}')
 
 
 @client.on(events.NewMessage(outgoing=True))
@@ -758,9 +758,9 @@ async def handle_gs_text(event):
     except Exception:
         pass
 
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 # АВТОУДАЛЕНИЕ СООБЩЕНИЙ В ЧАТАХ
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 
 async def _autodelete_worker(chat_id):
     """Рабочая функция для автоудаления в конкретном чате."""
@@ -825,7 +825,7 @@ async def handler_avtodel(event):
     worker = auto_delete_worker_map.get(chat_id)
     if worker is None or worker.done():
         auto_delete_worker_map[chat_id] = client.loop.create_task(_autodelete_worker(chat_id))
-    resp = await event.respond(f"⏰ Автоудаление: {val}{unit}")
+    resp = await event.respond(f"Автоудаление: {val}{unit}")
     client.loop.create_task(_delete_after(resp, 30))
 
 @client.on(events.NewMessage(outgoing=True, pattern=r'^\.avtoff$'))
@@ -854,7 +854,7 @@ async def handler_avtoff(event):
         except Exception:
             pass
         auto_delete_queue_map[chat_id] = None
-    resp = await event.respond("✅ Автоудаление выключено")
+    resp = await event.respond("Автоудаление выключено")
     client.loop.create_task(_delete_after(resp, 30))
 
 @client.on(events.NewMessage(outgoing=True))
@@ -879,9 +879,9 @@ async def _collect_for_autodelete(event):
     except Exception:
         pass
 
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 # DELALL - УДАЛЕНИЕ ВСЕХ СООБЩЕНИЙ
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 
 @client.on(events.NewMessage(outgoing=True, pattern=r'^\.delall(?:\s+(.+))?$'))
 async def handler_delall(event):
@@ -898,7 +898,7 @@ async def handler_delall(event):
                 entity = await client.get_entity(arg)
                 target = entity.id
     except Exception:
-        await event.respond("❌ Не удалось определить чат")
+        await event.respond("Не удалось определить чат")
         return
     del_text, del_entities = _custom_emoji_prefix(DELALL_EMOJI_ID, " Удаление...")
     temp = await client.send_message(event.chat_id, del_text, formatting_entities=del_entities)
@@ -914,16 +914,16 @@ async def handler_delall(event):
                     await asyncio.sleep(0.1)
                 except Exception:
                     pass
-            final_text, final_entities = _custom_emoji_suffix(DELALL_EMOJI_ID, f"✅ Удалено {len(ids)} сообщений")
+            final_text, final_entities = _custom_emoji_suffix(DELALL_EMOJI_ID, f"Удалено {len(ids)} сообщений")
             final = await client.send_message(event.chat_id, final_text, formatting_entities=final_entities)
             asyncio.create_task(_delete_later([temp, final], 30))
             gc.collect()
         else:
-            final_text, final_entities = _custom_emoji_suffix(DELALL_EMOJI_ID, "ℹ️ Нет сообщений")
+            final_text, final_entities = _custom_emoji_suffix(DELALL_EMOJI_ID, "Нет сообщений")
             final = await client.send_message(event.chat_id, final_text, formatting_entities=final_entities)
             asyncio.create_task(_delete_later([temp, final], 30))
     except Exception:
-        blank_text, blank_entities = _custom_emoji_suffix(DELALL_EMOJI_ID, "❌ Ошибка")
+        blank_text, blank_entities = _custom_emoji_suffix(DELALL_EMOJI_ID, "Ошибка")
         blank = await client.send_message(event.chat_id, blank_text, formatting_entities=blank_entities)
         asyncio.create_task(_delete_later([temp, blank], 30))
 
@@ -938,17 +938,17 @@ async def handler_del_count(event):
         ids = [m.id for m in msgs]
         if ids:
             await client.delete_messages(event.chat_id, ids)
-            resp = await event.respond(f"✅ Удалено {len(ids)} сообщений")
+            resp = await event.respond(f"Удалено {len(ids)} сообщений")
             asyncio.create_task(_delete_later([resp], 30))
         else:
-            resp = await event.respond("ℹ️ Нет сообщений для удаления")
+            resp = await event.respond("Нет сообщений для удаления")
             asyncio.create_task(_delete_later([resp], 30))
     except Exception:
         pass
 
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 # SBAN - БАН И УДАЛЕНИЕ СООБЩЕНИЙ
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 
 @client.on(events.NewMessage(outgoing=True, pattern=r'(?i)^\.sban(?:\s+(.+))?$'))
 async def sban(event):
@@ -986,7 +986,7 @@ async def sban(event):
     except Exception as e:
         try:
             tb = traceback.format_exc()
-            await client.send_message(OWNER_ID, f"❌ sban error: {e}\n\n{tb}")
+            await client.send_message(OWNER_ID, f"sban error: {e}\n\n{tb}")
         except Exception:
             pass
         try:
@@ -994,9 +994,9 @@ async def sban(event):
         except Exception:
             pass
 
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 # УПРАВЛЕНИЕ КАНАЛАМИ
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 
 async def _resolve_channel_entity(raw: str):
     """Надёжно находит канал по ID, @username или ссылке t.me.
@@ -1065,12 +1065,12 @@ async def add_channel(event):
         c = _scan_cache[int(raw) - 1]
         cid, title = c['id'], c['title']
         if cid in monitored_channels:
-            await event.edit(f'ℹ️ Уже добавлен: {title}')
+            await event.edit(f'Уже добавлен: {title}')
         elif add_channel_db(cid):
             monitored_channels.append(cid)
-            await event.edit(f'✅ Добавлен: {title}\nID: {cid}')
+            await event.edit(f'Добавлен: {title}\nID: {cid}')
         else:
-            await event.edit('❌ Ошибка БД')
+            await event.edit('Ошибка БД')
         await asyncio.sleep(5)
         await event.delete()
         return
@@ -1079,14 +1079,14 @@ async def add_channel(event):
         channel_id = utils.get_peer_id(entity)
         title = getattr(entity, 'title', None) or getattr(entity, 'username', None) or str(channel_id)
         if channel_id in monitored_channels:
-            await event.edit(f'ℹ️ Уже добавлен: {title}')
+            await event.edit(f'Уже добавлен: {title}')
         elif add_channel_db(channel_id):
             monitored_channels.append(channel_id)
-            await event.edit(f'✅ Добавлен: {title}\nID: {channel_id}')
+            await event.edit(f'Добавлен: {title}\nID: {channel_id}')
         else:
-            await event.edit('❌ Ошибка БД')
+            await event.edit('Ошибка БД')
     except Exception as e:
-        await event.edit(f'❌ {e}')
+        await event.edit(f'{e}')
     await asyncio.sleep(5)
     await event.delete()
 
@@ -1102,7 +1102,7 @@ async def _remove_monitored(event, cid, title=None):
     remove_channel_db(cid)
     if cid in monitored_channels:
         monitored_channels.remove(cid)
-    await event.edit(f'✅ Убран: {title}\nID: {cid}')
+    await event.edit(f'Убран: {title}\nID: {cid}')
     await asyncio.sleep(5)
     await event.delete()
 
@@ -1138,7 +1138,7 @@ async def remove_channel(event):
             await _remove_monitored(event, matches[0][0], matches[0][1])
             return
         if len(matches) > 1:
-            lines = ['🔎 Несколько совпадений — уточни номером:', '']
+            lines = ['Несколько совпадений — уточни номером:', '']
             for cid, title in matches:
                 idx = monitored_channels.index(cid) + 1
                 lines.append(f'{idx}. {title}')
@@ -1166,9 +1166,9 @@ async def remove_channel(event):
         if cid in monitored_channels:
             monitored_channels.remove(cid)
     if removed:
-        await event.edit(f'✅ Удалён\nID: {channel_id if channel_id is not None else raw_id}')
+        await event.edit(f'Удалён\nID: {channel_id if channel_id is not None else raw_id}')
     else:
-        await event.edit('❌ Не найден')
+        await event.edit('Не найден')
     await asyncio.sleep(5)
     await event.delete()
 
@@ -1179,26 +1179,51 @@ async def list_channels(event):
         await event.delete()
         return
     if not monitored_channels:
-        await event.edit('📋 Список пуст\n\n'
-                          '🔍 .scan — найти каналы с комментами\n'
-                          '➕ .addall — добавить все сразу')
-    else:
-        text = '📋 ОТСЛЕЖИВАЕМЫЕ КАНАЛЫ:\n' + '═' * 30 + '\n\n'
-        for idx, channel_id in enumerate(monitored_channels, 1):
-            try:
-                entity = await client.get_entity(channel_id)
-                text += f'{idx}. {entity.title}\n'
-                text += f'   📌 ID: {channel_id}\n'
-                text += f'   ❌ Убрать: .remove {idx}\n\n'
-            except Exception:
-                text += f'{idx}. [НЕДОСТУПЕН]\n'
-                text += f'   📌 ID: {channel_id}\n'
-                text += f'   ❌ Убрать: .remove {idx}\n\n'
-        text += '═' * 30 + f'\n📊 ВСЕГО: {len(monitored_channels)} каналов\n'
-        text += '\n🔍 .scan — найти ещё | ➕ .addall — добавить все'
-        await event.edit(text)
-    await asyncio.sleep(20)
-    await event.delete()
+        await event.edit('Список пуст. .scan - найти каналы, .addall - добавить все')
+        await asyncio.sleep(20)
+        try:
+            await event.delete()
+        except Exception:
+            pass
+        return
+
+    chans = list(monitored_channels)
+    lines = [f'Каналы ({len(chans)}):', '']
+    for idx, channel_id in enumerate(chans, 1):
+        try:
+            entity = await client.get_entity(channel_id)
+            title = (getattr(entity, 'title', None) or str(channel_id))[:35]
+        except Exception:
+            title = '[недоступен]'
+        lines.append(f'{idx}. {title} [{channel_id}]')
+    lines += ['', 'Убрать: .remove <номер|название> | .scan | .addall']
+
+    # Telegram режет сообщения на 4096 символов — бьём на части
+    chunks, buf = [], ''
+    for ln in lines:
+        if len(buf) + len(ln) + 1 > 3500:
+            chunks.append(buf)
+            buf = ''
+        buf += ln + '\n'
+    if buf:
+        chunks.append(buf)
+
+    sent = []
+    try:
+        sent.append(await event.edit(chunks[0]))
+        for ch in chunks[1:]:
+            sent.append(await event.respond(ch))
+    except Exception:
+        try:
+            await event.edit('Список слишком длинный, не удалось показать')
+        except Exception:
+            pass
+    await asyncio.sleep(45)
+    for m in sent:
+        try:
+            await m.delete()
+        except Exception:
+            pass
 
 @client.on(events.NewMessage(outgoing=True, pattern=r'^\.scan$'))
 async def scan_channels(event):
@@ -1207,18 +1232,18 @@ async def scan_channels(event):
         await event.delete()
         return
     global _scan_cache
-    loading = await event.edit('🔍 Сканирую подписки... это может занять минуту')
+    loading = await event.edit('Сканирую подписки... это может занять минуту')
 
     async def _prog(n):
         try:
-            await loading.edit(f'🔍 Сканирую... проверено {n}')
+            await loading.edit(f'Сканирую... проверено {n}')
         except Exception:
             pass
 
     try:
         found = await _scan_commentable_channels(progress=_prog)
     except Exception as e:
-        await loading.edit(f'❌ Ошибка сканирования: {e}')
+        await loading.edit(f'Ошибка сканирования: {e}')
         await asyncio.sleep(8)
         await event.delete()
         return
@@ -1227,7 +1252,7 @@ async def scan_channels(event):
     _scan_cache = commentable
 
     if not commentable:
-        await loading.edit('🔍 Каналов с комментами не найдено.\n'
+        await loading.edit('Каналов с комментами не найдено.\n'
                             'Подпишись на нужные каналы этим аккаунтом и повтори .scan')
         await asyncio.sleep(15)
         await event.delete()
@@ -1235,27 +1260,27 @@ async def scan_channels(event):
 
     mon = set(monitored_channels)
     already = len([c for c in commentable if c['id'] in mon])
-    lines = ['🔍 КАНАЛЫ С КОММЕНТАМИ:', '═' * 28, '']
+    lines = ['КАНАЛЫ С КОММЕНТАМИ:', '' * 28, '']
     show = commentable[:60]
     for i, c in enumerate(show, 1):
-        mark = '✅' if c['id'] in mon else '➕'
+        mark = '' if c['id'] in mon else ''
         lines.append(f"{i}. {mark} {c['title']}")
     if len(commentable) > len(show):
         lines.append(f'… и ещё {len(commentable) - len(show)}')
     lines += [
         '',
-        '═' * 28,
-        f'Всего: {len(commentable)} | ✅ уже добавлено: {already}',
+        '' * 28,
+        f'Всего: {len(commentable)} | уже добавлено: {already}',
         '',
-        '➕ .addall — добавить ВСЕ',
-        '➕ .add <N> — по номеру (напр. .add 3)',
-        '❌ .remove <N|название> — убрать',
+        '.addall — добавить ВСЕ',
+        '.add <N> — по номеру (напр. .add 3)',
+        '.remove <N|название> — убрать',
     ]
     try:
         await loading.edit('\n'.join(lines))
     except Exception:
-        await loading.edit(f'🔍 Найдено каналов с комментами: {len(commentable)}\n'
-                           f'✅ уже добавлено: {already}\n\n➕ .addall — добавить все')
+        await loading.edit(f'Найдено каналов с комментами: {len(commentable)}\n'
+                           f'уже добавлено: {already}\n\n.addall — добавить все')
     await asyncio.sleep(120)
     await event.delete()
 
@@ -1266,7 +1291,7 @@ async def add_all_channels(event):
         await event.delete()
         return
     global _scan_cache
-    loading = await event.edit('🔄 Ищу каналы с комментами...')
+    loading = await event.edit('Ищу каналы с комментами...')
     src = _scan_cache
     if not src:
         try:
@@ -1274,12 +1299,12 @@ async def add_all_channels(event):
             src = [c for c in found if c['commentable']]
             _scan_cache = src
         except Exception as e:
-            await loading.edit(f'❌ Ошибка: {e}')
+            await loading.edit(f'Ошибка: {e}')
             await asyncio.sleep(8)
             await event.delete()
             return
     if not src:
-        await loading.edit('ℹ️ Нечего добавлять — каналов с комментами не найдено')
+        await loading.edit('Нечего добавлять — каналов с комментами не найдено')
         await asyncio.sleep(10)
         await event.delete()
         return
@@ -1295,19 +1320,19 @@ async def add_all_channels(event):
         else:
             failed += 1
         await asyncio.sleep(0.05)
-    msg = (f'✅ Готово\n'
-           f'➕ Добавлено: {added}\n'
-           f'⏭ Уже было: {skipped}\n'
-           f'📊 Всего в списке: {len(monitored_channels)}')
+    msg = (f'Готово\n'
+           f'Добавлено: {added}\n'
+           f'Уже было: {skipped}\n'
+           f'Всего в списке: {len(monitored_channels)}')
     if failed:
-        msg += f'\n⚠️ Ошибка БД: {failed}'
+        msg += f'\nОшибка БД: {failed}'
     await loading.edit(msg)
     await asyncio.sleep(30)
     await event.delete()
 
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 # РУЧНАЯ ОЧИСТКА КОММЕНТОВ
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 
 @client.on(events.NewMessage(outgoing=True, pattern=r'^\.cle(?:an|ar)$'))
 async def manual_clean_all(event):
@@ -1319,22 +1344,22 @@ async def manual_clean_all(event):
         await event.delete()
         return
     if not monitored_channels:
-        resp = await event.respond('📋 Список каналов пуст')
+        resp = await event.respond('Список каналов пуст')
         asyncio.create_task(_delete_after(resp, 10))
         return
-    loading = await event.respond(f'🔄 Очищаю {len(monitored_channels)} каналов...')
+    loading = await event.respond(f'Очищаю {len(monitored_channels)} каналов...')
     total = 0
     channels_snapshot = list(monitored_channels)
     for idx, cid in enumerate(channels_snapshot, 1):
         try:
-            await loading.edit(f'🔄 Очищаю... [{idx}/{len(channels_snapshot)}]')
+            await loading.edit(f'Очищаю... [{idx}/{len(channels_snapshot)}]')
             count = await _delete_my_comments_in_channel(cid)
             total += count
             await asyncio.sleep(random.uniform(1.5, 3))
         except Exception:
             pass
     save_autoclean_state(time.time())
-    final = await loading.edit(f'✅ Очистка завершена\n💬 Удалено: {total} комментариев')
+    final = await loading.edit(f'Очистка завершена\nУдалено: {total} комментариев')
     asyncio.create_task(_delete_after(final, 30))
 
 @client.on(events.NewMessage(outgoing=True, pattern=r'^\.cle(?:an|ar) (-?\d+)$'))
@@ -1344,14 +1369,14 @@ async def manual_clean_one(event):
         await event.delete()
         return
     cid = int(event.pattern_match.group(1))
-    loading = await event.respond(f'🔄 Очищаю канал {cid}...')
+    loading = await event.respond(f'Очищаю канал {cid}...')
     count = await _delete_my_comments_in_channel(cid)
-    final = await loading.edit(f'✅ Очистка завершена\n💬 Удалено: {count} комментариев')
+    final = await loading.edit(f'Очистка завершена\nУдалено: {count} комментариев')
     asyncio.create_task(_delete_after(final, 30))
 
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 # ОБСУЖДЕНИЯ (DISCUSSIONS)
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 
 async def _channel_has_discussion(chat_id):
     """Проверяет наличие группы обсуждений у канала."""
@@ -1489,9 +1514,9 @@ async def _scan_commentable_channels(progress=None, hard_cap=1000):
         await asyncio.sleep(0.25)  # анти-флуд
     return results
 
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 # АВТОКОММЕНТАРИЙ
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 
 @client.on(events.NewMessage())
 async def auto_comment(event):
@@ -1566,7 +1591,7 @@ async def auto_comment(event):
                     try:
                         await client.send_message(
                             OWNER_ID,
-                            f'⛔ Бан в {event.chat_id}\n'
+                            f'Бан в {event.chat_id}\n'
                             f'Убран из списка, вышел: {left}\n{str(e)[:80]}'
                         )
                     except Exception:
@@ -1583,9 +1608,9 @@ async def auto_comment(event):
     except Exception as e:
         pass
 
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 # ИЗОБРАЖЕНИЯ
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 
 def _optimize_image(image_bytes):
     """Оптимизирует изображение для отправки."""
@@ -1672,9 +1697,9 @@ async def _download_and_encode_image(message):
     except Exception:
         return None
 
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 # СПРАВКА
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 
 @client.on(events.NewMessage(outgoing=True, pattern=r'^\.help$'))
 async def cmd_help(event):
@@ -1683,9 +1708,9 @@ async def cmd_help(event):
         await event.delete()
         return
     text = (
-        "📋 ДОСТУПНЫЕ КОМАНДЫ:\n"
-        "═" * 35 + "\n\n"
-        "📌 УПРАВЛЕНИЕ КАНАЛАМИ:\n"
+        "ДОСТУПНЫЕ КОМАНДЫ:\n"
+        "" * 35 + "\n\n"
+        "УПРАВЛЕНИЕ КАНАЛАМИ:\n"
         "  .scan              найти все каналы с комментами\n"
         "  .addall            добавить ВСЕ найденные сразу\n"
         "  .add <N>           добавить по номеру из .scan\n"
@@ -1694,71 +1719,71 @@ async def cmd_help(event):
         "  .remove <название> убрать по названию канала\n"
         "  .remove <ID/@>     убрать по ID или @username\n"
         "  .list              показать список каналов\n\n"
-        "💬 КОММЕНТАРИИ:\n"
+        "КОММЕНТАРИИ:\n"
         "  .clean / .clear    принудительно удалить ВСЕ мои комменты везде\n"
         "  .clean/.clear <ID> удалить в одном канале\n\n"
-        "🗑️  УДАЛЕНИЕ СООБЩЕНИЙ:\n"
+        " УДАЛЕНИЕ СООБЩЕНИЙ:\n"
         "  .delall            удалить все мои сообщения в чате\n"
         "  .delall <ID>       удалить в другом чате\n"
         "  .del <N>           удалить последние N сообщений\n\n"
-        "⏰ АВТОУДАЛЕНИЕ В ЧАТЕ:\n"
+        "АВТОУДАЛЕНИЕ В ЧАТЕ:\n"
         "  .avtodel <N>s      через N секунд\n"
         "  .avtodel <N>m      через N минут\n"
         "  .avtodel <N>h      через N часов\n"
         "  .avtodel <N>d      через N дней\n"
         "  .avtoff            отключить\n\n"
-        "🚫 БАН:\n"
+        "БАН:\n"
         "  .sban              (на ответ) - забанить + удалить сообщения\n"
         "  .sban <ID/@>       забанить по ID или ник\n\n"
-        "🎙 ТРАНСКРИБАЦИЯ ГОЛОСОВЫХ:\n"
+        "ТРАНСКРИБАЦИЯ ГОЛОСОВЫХ:\n"
         "  .gn                включить (авто для всех гс)\n"
         "  .gf                выключить\n\n"
         "  .kick              включить автокик\n"
         "  .kickf             выключить\n\n"
-        "ℹ️  .help             эта справка\n"
+        " .help             эта справка\n"
     )
     resp = await event.respond(text)
     asyncio.create_task(_delete_after(resp, 60))
 
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 # ГЛАВНАЯ ФУНКЦИЯ И ЗАПУСК
-# ═══════════════════════════════════════════════════════════════════════════
+# 
 
 async def main():
     """Инициализирует бота и запускает все фоновые задачи."""
     global autoclean_task, monitored_channels
     
-    print('🚀 Запуск юзербота...')
+    print('Запуск юзербота...')
     
     # Инициализация БД
     init_db()
     
     # Загрузка каналов
     monitored_channels = load_channels()
-    print(f'📌 Загружено {len(monitored_channels)} каналов')
+    print(f'Загружено {len(monitored_channels)} каналов')
     
     # Загрузка состояния автокика
     await load_kick_state()
-    print(f'⚙️  Состояние автокика: {"ВКЛ" if kick_enabled else "ВЫКЛ"}')
+    print(f' Состояние автокика: {"ВКЛ" if kick_enabled else "ВЫКЛ"}')
     
     # Запуск фоновой задачи автоочистки
     autoclean_task = asyncio.create_task(autoclean_loop())
-    print('🔄 Автоочистка адеюирована (раз в 3 дня)')
+    print('Автоочистка адеюирована (раз в 3 дня)')
     
     # Если автокик был включен, перезапускаем его
     global monitor_task
     if kick_enabled:
         monitor_task = asyncio.create_task(monitor_sessions())
-        print('✅ Автокик перезапущен')
+        print('Автокик перезапущен')
     
-    print('✅ Юзербот готов!')
-    print(f'👤 Владелец: {OWNER_ID}')
-    print('━' * 40)
+    print('Юзербот готов!')
+    print(f'Владелец: {OWNER_ID}')
+    print('' * 40)
 
 async def on_stop():
     """Останавливает бота корректно."""
     global autoclean_task, monitor_task
-    print('\n🛑 Остановка...')
+    print('\nОстановка...')
     if autoclean_task:
         autoclean_task.cancel()
     if monitor_task:
@@ -1771,4 +1796,4 @@ if __name__ == '__main__':
             client.run_until_disconnected()
         except KeyboardInterrupt:
             client.loop.run_until_complete(on_stop())
-            print('✅ Юзербот остановлен')
+            print('Юзербот остановлен')
