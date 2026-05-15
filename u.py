@@ -189,6 +189,10 @@ _channel_no_discussion_cache = set()
 _CHANNEL_NO_DISCUSSION_CACHE_TTL = 3600
 _last_discussion_check = {}
 
+# Результат последнего .scan: список {'id','title','commentable'} —
+# чтобы можно было добавлять каналы по номеру (.add 3), а не по ID.
+_scan_cache = []
+
 state_file = "kick_state.json"
 kick_enabled = False
 gs_enabled = False
@@ -1055,6 +1059,21 @@ async def add_channel(event):
         await event.delete()
         return
     raw = event.pattern_match.group(1).strip()
+    # .add <N> — добавить по номеру из последнего .scan (ID каналов огромные,
+    # поэтому маленькое число 1..len однозначно трактуется как номер).
+    if raw.isdigit() and _scan_cache and 1 <= int(raw) <= len(_scan_cache):
+        c = _scan_cache[int(raw) - 1]
+        cid, title = c['id'], c['title']
+        if cid in monitored_channels:
+            await event.edit(f'ℹ️ Уже добавлен: {title}')
+        elif add_channel_db(cid):
+            monitored_channels.append(cid)
+            await event.edit(f'✅ Добавлен: {title}\nID: {cid}')
+        else:
+            await event.edit('❌ Ошибка БД')
+        await asyncio.sleep(5)
+        await event.delete()
+        return
     try:
         entity = await _resolve_channel_entity(raw)
         channel_id = utils.get_peer_id(entity)
@@ -1078,6 +1097,23 @@ async def remove_channel(event):
         await event.delete()
         return
     raw = event.pattern_match.group(1).strip()
+    # .remove <N> — убрать по номеру из .list (ID каналов огромные, поэтому
+    # маленькое число 1..len — это номер позиции, а не ID).
+    if raw.isdigit() and 1 <= int(raw) <= len(monitored_channels):
+        cid = monitored_channels[int(raw) - 1]
+        title = str(cid)
+        try:
+            ent = await client.get_entity(cid)
+            title = getattr(ent, 'title', None) or title
+        except Exception:
+            pass
+        remove_channel_db(cid)
+        if cid in monitored_channels:
+            monitored_channels.remove(cid)
+        await event.edit(f'✅ Убран: {title}\nID: {cid}')
+        await asyncio.sleep(5)
+        await event.delete()
+        return
     raw_id = int(raw) if re.fullmatch(r'-?\d+', raw) else None
     channel_id = None
     try:
@@ -1107,7 +1143,9 @@ async def list_channels(event):
         await event.delete()
         return
     if not monitored_channels:
-        await event.edit('📋 Список пуст\n\n.add <ID> для добавления')
+        await event.edit('📋 Список пуст\n\n'
+                          '🔍 .scan — найти каналы с комментами\n'
+                          '➕ .addall — добавить все сразу')
     else:
         text = '📋 ОТСЛЕЖИВАЕМЫЕ КАНАЛЫ:\n' + '═' * 30 + '\n\n'
         for idx, channel_id in enumerate(monitored_channels, 1):
@@ -1115,15 +1153,120 @@ async def list_channels(event):
                 entity = await client.get_entity(channel_id)
                 text += f'{idx}. {entity.title}\n'
                 text += f'   📌 ID: {channel_id}\n'
-                text += f'   ❌ Удалить: .remove {channel_id}\n\n'
+                text += f'   ❌ Убрать: .remove {idx}\n\n'
             except Exception:
                 text += f'{idx}. [НЕДОСТУПЕН]\n'
                 text += f'   📌 ID: {channel_id}\n'
-                text += f'   ❌ Удалить: .remove {channel_id}\n\n'
+                text += f'   ❌ Убрать: .remove {idx}\n\n'
         text += '═' * 30 + f'\n📊 ВСЕГО: {len(monitored_channels)} каналов\n'
-        text += '\n✅ .add <ID> - добавить новый канал'
+        text += '\n🔍 .scan — найти ещё | ➕ .addall — добавить все'
         await event.edit(text)
     await asyncio.sleep(20)
+    await event.delete()
+
+@client.on(events.NewMessage(outgoing=True, pattern=r'^\.scan$'))
+async def scan_channels(event):
+    """Находит все подписанные каналы с комментами (ТОЛЬКО OWNER)."""
+    if event.sender_id != OWNER_ID:
+        await event.delete()
+        return
+    global _scan_cache
+    loading = await event.edit('🔍 Сканирую подписки... это может занять минуту')
+
+    async def _prog(n):
+        try:
+            await loading.edit(f'🔍 Сканирую... проверено {n}')
+        except Exception:
+            pass
+
+    try:
+        found = await _scan_commentable_channels(progress=_prog)
+    except Exception as e:
+        await loading.edit(f'❌ Ошибка сканирования: {e}')
+        await asyncio.sleep(8)
+        await event.delete()
+        return
+
+    commentable = [c for c in found if c['commentable']]
+    _scan_cache = commentable
+
+    if not commentable:
+        await loading.edit('🔍 Каналов с комментами не найдено.\n'
+                            'Подпишись на нужные каналы этим аккаунтом и повтори .scan')
+        await asyncio.sleep(15)
+        await event.delete()
+        return
+
+    mon = set(monitored_channels)
+    already = len([c for c in commentable if c['id'] in mon])
+    lines = ['🔍 КАНАЛЫ С КОММЕНТАМИ:', '═' * 28, '']
+    show = commentable[:60]
+    for i, c in enumerate(show, 1):
+        mark = '✅' if c['id'] in mon else '➕'
+        lines.append(f"{i}. {mark} {c['title']}")
+    if len(commentable) > len(show):
+        lines.append(f'… и ещё {len(commentable) - len(show)}')
+    lines += [
+        '',
+        '═' * 28,
+        f'Всего: {len(commentable)} | ✅ уже добавлено: {already}',
+        '',
+        '➕ .addall — добавить ВСЕ',
+        '➕ .add <N> — по номеру (напр. .add 3)',
+        '❌ .remove <N> — убрать по номеру (.list)',
+    ]
+    try:
+        await loading.edit('\n'.join(lines))
+    except Exception:
+        await loading.edit(f'🔍 Найдено каналов с комментами: {len(commentable)}\n'
+                           f'✅ уже добавлено: {already}\n\n➕ .addall — добавить все')
+    await asyncio.sleep(120)
+    await event.delete()
+
+@client.on(events.NewMessage(outgoing=True, pattern=r'^\.addall$'))
+async def add_all_channels(event):
+    """Добавляет все найденные каналы с комментами (ТОЛЬКО OWNER)."""
+    if event.sender_id != OWNER_ID:
+        await event.delete()
+        return
+    global _scan_cache
+    loading = await event.edit('🔄 Ищу каналы с комментами...')
+    src = _scan_cache
+    if not src:
+        try:
+            found = await _scan_commentable_channels()
+            src = [c for c in found if c['commentable']]
+            _scan_cache = src
+        except Exception as e:
+            await loading.edit(f'❌ Ошибка: {e}')
+            await asyncio.sleep(8)
+            await event.delete()
+            return
+    if not src:
+        await loading.edit('ℹ️ Нечего добавлять — каналов с комментами не найдено')
+        await asyncio.sleep(10)
+        await event.delete()
+        return
+    added = skipped = failed = 0
+    for c in src:
+        cid = c['id']
+        if cid in monitored_channels:
+            skipped += 1
+            continue
+        if add_channel_db(cid):
+            monitored_channels.append(cid)
+            added += 1
+        else:
+            failed += 1
+        await asyncio.sleep(0.05)
+    msg = (f'✅ Готово\n'
+           f'➕ Добавлено: {added}\n'
+           f'⏭ Уже было: {skipped}\n'
+           f'📊 Всего в списке: {len(monitored_channels)}')
+    if failed:
+        msg += f'\n⚠️ Ошибка БД: {failed}'
+    await loading.edit(msg)
+    await asyncio.sleep(30)
     await event.delete()
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1212,6 +1355,54 @@ async def _try_join_discussion_group(chat_id):
     except Exception:
         pass
     return False
+
+async def _scan_commentable_channels(progress=None, hard_cap=1000):
+    """Сканирует подписки и возвращает каналы с включёнными комментариями.
+
+    Возвращает список dict: {'id','title','commentable'}. Устойчиво к ошибкам
+    и FloodWait — не падает, проблемные каналы пропускает.
+    """
+    results = []
+    processed = 0
+    checked = 0
+    async for dialog in client.iter_dialogs():
+        if processed >= hard_cap:
+            break
+        processed += 1
+        ent = dialog.entity
+        # Нужны только каналы-вещатели (посты + комменты), не группы/чаты
+        if not getattr(ent, 'broadcast', False):
+            continue
+        title = (getattr(ent, 'title', None)
+                 or getattr(ent, 'username', None)
+                 or str(getattr(ent, 'id', '?')))
+        title = str(title)[:40]
+        commentable = False
+        for _attempt in range(2):
+            try:
+                full = await client(GetFullChannelRequest(ent))
+                linked = getattr(full.full_chat, 'linked_chat_id', None)
+                commentable = bool(linked) and linked != 0
+                break
+            except errors.FloodWaitError as e:
+                await asyncio.sleep(min(getattr(e, 'seconds', 5), 30))
+            except Exception:
+                break
+        try:
+            cid = utils.get_peer_id(ent)
+        except Exception:
+            cid = getattr(ent, 'id', None)
+        if cid is None:
+            continue
+        results.append({'id': cid, 'title': title, 'commentable': commentable})
+        checked += 1
+        if progress and checked % 15 == 0:
+            try:
+                await progress(checked)
+            except Exception:
+                pass
+        await asyncio.sleep(0.25)  # анти-флуд
+    return results
 
 # ═══════════════════════════════════════════════════════════════════════════
 # АВТОКОММЕНТАРИЙ
@@ -1401,8 +1592,12 @@ async def cmd_help(event):
         "📋 ДОСТУПНЫЕ КОМАНДЫ:\n"
         "═" * 35 + "\n\n"
         "📌 УПРАВЛЕНИЕ КАНАЛАМИ:\n"
-        "  .add <ID>          добавить канал\n"
-        "  .remove <ID>       удалить канал\n"
+        "  .scan              найти все каналы с комментами\n"
+        "  .addall            добавить ВСЕ найденные сразу\n"
+        "  .add <N>           добавить по номеру из .scan\n"
+        "  .add <ID/@>        добавить по ID или @username\n"
+        "  .remove <N>        убрать по номеру из .list\n"
+        "  .remove <ID/@>     убрать по ID или @username\n"
         "  .list              показать список каналов\n\n"
         "💬 КОММЕНТАРИИ:\n"
         "  .clean / .clear    принудительно удалить ВСЕ мои комменты везде\n"
