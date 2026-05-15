@@ -16,7 +16,7 @@ import logging
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, functions, errors, utils
 from telethon.sessions import StringSession
-from telethon.tl.functions.channels import EditBannedRequest, GetFullChannelRequest, JoinChannelRequest
+from telethon.tl.functions.channels import EditBannedRequest, GetFullChannelRequest, JoinChannelRequest, LeaveChannelRequest
 from telethon.tl.functions.messages import DeleteChatUserRequest
 from telethon.tl.types import ChatBannedRights, MessageEntityCustomEmoji, PeerChannel, PeerChat
 import psycopg2
@@ -1392,6 +1392,55 @@ async def _try_join_discussion_group(chat_id):
         pass
     return False
 
+async def _leave_entity(ent):
+    """Выходит из канала/группы. Сначала LeaveChannelRequest, потом
+    delete_dialog как запасной вариант. Любые ошибки гасим."""
+    if ent is None:
+        return False
+    try:
+        await client(LeaveChannelRequest(ent))
+        return True
+    except Exception:
+        pass
+    try:
+        await client.delete_dialog(ent)
+        return True
+    except Exception:
+        return False
+
+async def _leave_channel_and_discussion(channel_id):
+    """Покидает И группу обсуждения, И сам канал (где забанили).
+
+    Возвращает строку-описание, что удалось покинуть. Устойчиво к ошибкам.
+    """
+    left = []
+    channel_ent = None
+    try:
+        channel_ent = await client.get_entity(channel_id)
+    except Exception:
+        channel_ent = None
+
+    # 1) Группа обсуждения (там, где обычно и прилетает бан за комменты)
+    try:
+        if channel_ent is not None and getattr(channel_ent, 'broadcast', False):
+            full = await client(GetFullChannelRequest(channel_ent))
+            linked = getattr(full.full_chat, 'linked_chat_id', None)
+            if linked and linked != 0:
+                try:
+                    linked_ent = await client.get_entity(linked)
+                except Exception:
+                    linked_ent = None
+                if await _leave_entity(linked_ent):
+                    left.append('группа комментов')
+    except Exception:
+        pass
+
+    # 2) Сам канал
+    if await _leave_entity(channel_ent):
+        left.append('канал')
+
+    return ', '.join(left) if left else 'не удалось выйти'
+
 async def _scan_commentable_channels(progress=None, hard_cap=1000):
     """Сканирует подписки и возвращает каналы с включёнными комментариями.
 
@@ -1509,10 +1558,19 @@ async def auto_comment(event):
                         if to_remove in monitored_channels:
                             monitored_channels.remove(to_remove)
                         remove_channel_db(to_remove)
-                        try:
-                            await client.send_message(OWNER_ID, f'⛔ Канал {event.chat_id} удалён: {str(e)[:80]}')
-                        except Exception:
-                            pass
+                    # Где забанили — выходим И из группы комментов, И из канала
+                    try:
+                        left = await _leave_channel_and_discussion(event.chat_id)
+                    except Exception:
+                        left = 'ошибка выхода'
+                    try:
+                        await client.send_message(
+                            OWNER_ID,
+                            f'⛔ Бан в {event.chat_id}\n'
+                            f'Убран из списка, вышел: {left}\n{str(e)[:80]}'
+                        )
+                    except Exception:
+                        pass
                     return
                 return
             except Exception as e:
