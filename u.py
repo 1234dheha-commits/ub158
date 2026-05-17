@@ -721,14 +721,23 @@ async def handle_gs_voice(event):
         text = await _transcribe_voice(voice_bytes)
         if not text:
             return
-        # Голосовое нельзя превратить в текст через edit() — Telegram отвечает
-        # "message ID invalid / inline bot callback". Отправляем расшифровку
-        # ответом на голосовое.
-        quote = f'<blockquote>{html.escape(text)}</blockquote>'
+        # Лимит подписи у медиа в Telegram: 1024 символа (2048 с Premium).
+        # Режем с запасом — иначе edit голосового падает по длине (это и была
+        # причина старых ошибок EditMessageRequest на длинных гс).
+        MAX_CAP = 1000
+        clipped = text if len(text) <= MAX_CAP else text[:MAX_CAP].rstrip() + '…'
+        quote = f'<blockquote>{html.escape(clipped)}</blockquote>'
+        # Основной режим — РЕДАКТИРУЕМ само голосовое: голос остаётся, под ним
+        # появляется текст (как на скрине, с пометкой «изменено»).
         try:
-            await event.message.reply(quote, parse_mode='html')
+            await event.message.edit(quote, parse_mode='html')
         except Exception:
-            await event.respond(quote, parse_mode='html')
+            # Если Telegram всё же не дал отредактировать — не теряем
+            # расшифровку и не спамим ошибками: шлём ответом.
+            try:
+                await event.message.reply(quote, parse_mode='html')
+            except Exception:
+                await event.respond(quote, parse_mode='html')
         gc.collect()
     except Exception as e:
         print(f'handle_gs_voice: {e}')
