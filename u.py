@@ -745,7 +745,12 @@ async def handle_gs_voice(event):
 
 @client.on(events.NewMessage(outgoing=True))
 async def handle_gs_text(event):
-    """Автоматически меняет текстовое сообщение с «гс» на цитату."""
+    """«гс <текст>» → <текст> оформляется цитатой.
+
+    Триггер срабатывает ТОЛЬКО если сообщение начинается со слова «гс»:
+      «гс привет»  → цитата «привет»
+      «привет гс»  → НЕ трогаем (обычный текст)
+    """
     if event.sender_id != OWNER_ID:
         return
     if not gs_enabled:
@@ -755,13 +760,15 @@ async def handle_gs_text(event):
         return
     if text.strip().startswith('.'):
         return
-    if not re.search(r'\bгс\b', text, flags=re.IGNORECASE):
+    # «гс» только как первое слово; дальше — отделители и сам текст.
+    m = re.match(r'^\s*гс\b[\s,:;.\-—]*(.+)$', text,
+                 flags=re.IGNORECASE | re.DOTALL)
+    if not m:
         return
-    text = re.sub(r'(?i)\bгс\b', '', text, count=1).strip()
-    if not text:
+    body = m.group(1).strip()
+    if not body:
         return
-    text_esc = html.escape(text)
-    quote = f'<blockquote>{text_esc}</blockquote>'
+    quote = f'<blockquote>{html.escape(body)}</blockquote>'
     try:
         await event.edit(quote, parse_mode='html')
     except Exception:
