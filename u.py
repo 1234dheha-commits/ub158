@@ -1075,6 +1075,9 @@ async def add_channel(event):
         await event.delete()
         return
     raw = event.pattern_match.group(1).strip()
+    # Опечатка ".add all" / ".add ALL" / ".add все" → как ".addall".
+    if raw.lower() in ('all', 'все', 'всё'):
+        return await add_all_channels(event)
     # .add <N> — добавить по номеру из последнего .scan (ID каналов огромные,
     # поэтому маленькое число 1..len однозначно трактуется как номер).
     if raw.isdigit() and _scan_cache and 1 <= int(raw) <= len(_scan_cache):
@@ -1276,16 +1279,16 @@ async def scan_channels(event):
 
     mon = set(monitored_channels)
     already = len([c for c in commentable if c['id'] in mon])
-    lines = ['КАНАЛЫ С КОММЕНТАМИ:', '' * 28, '']
+    lines = ['КАНАЛЫ С КОММЕНТАМИ:', '-' * 28, '']
     show = commentable[:60]
     for i, c in enumerate(show, 1):
-        mark = '' if c['id'] in mon else ''
+        mark = '[+]' if c['id'] in mon else '[ ]'
         lines.append(f"{i}. {mark} {c['title']}")
     if len(commentable) > len(show):
         lines.append(f'… и ещё {len(commentable) - len(show)}')
     lines += [
         '',
-        '' * 28,
+        '-' * 28,
         f'Всего: {len(commentable)} | уже добавлено: {already}',
         '',
         '.addall — добавить ВСЕ',
@@ -1794,7 +1797,7 @@ async def main():
     
     print('Юзербот готов!')
     print(f'Владелец: {OWNER_ID}')
-    print('' * 40)
+    print('-' * 40)
 
 async def on_stop():
     """Останавливает бота корректно."""
