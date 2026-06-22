@@ -49,10 +49,17 @@ MAX_BASE64_SIZE = 2 * 1024 * 1024
 JPEG_QUALITY = 85
 MIN_JPEG_QUALITY = 70
 
-api_id = 16574055
-api_hash = "8081a59c5d3af267759dda758d817652"
-phone = "+380 77 706 7676"
-OWNER_ID = 7210276147
+# Creds читаем из окружения; fallback для локального запуска
+api_id = int(os.getenv('API_ID', '16574055'))
+api_hash = os.getenv('API_HASH', '8081a59c5d3af267759dda758d817652')
+phone = os.getenv('PHONE', '+380777067676')
+OWNER_ID = int(os.getenv('OWNER_ID', '7210276147'))
+
+# Анти-спам: per-channel cooldown + глобальные лимиты на комменты
+# (переопределяемо через env)
+PER_CHANNEL_COOLDOWN = int(os.getenv('PER_CHANNEL_COOLDOWN', '180'))  # сек между комментами в одном канале
+GLOBAL_PER_MIN = int(os.getenv('GLOBAL_PER_MIN', '5'))                # макс комментов в минуту суммарно
+GLOBAL_PER_HOUR = int(os.getenv('GLOBAL_PER_HOUR', '40'))             # макс комментов в час суммарно
 THINKING_EMOJI_ID = 5454074580010295588
 DELALL_EMOJI_ID = 5219901967916084166
 DATABASE_URL = os.getenv('DATABASE_URL')
@@ -192,6 +199,33 @@ _last_discussion_check = {}
 # Результат последнего .scan: список {'id','title','commentable'} —
 # чтобы можно было добавлять каналы по номеру (.add 3), а не по ID.
 _scan_cache = []
+
+# Анти-спам комментариев: трекаем когда последний раз комментили в канале
+# и сколько комментов было суммарно за окно (для глобальных лимитов).
+from collections import deque as _deque
+_last_comment_per_channel = {}        # channel_id -> timestamp
+_recent_comment_times = _deque(maxlen=500)
+
+def _can_comment(channel_id):
+    """Можно ли комментить сейчас в этом канале (per-channel + global limits)."""
+    now = time.time()
+    last = _last_comment_per_channel.get(channel_id, 0)
+    if now - last < PER_CHANNEL_COOLDOWN:
+        return False, f'channel cd {int(PER_CHANNEL_COOLDOWN - (now - last))}s'
+    cutoff_min = now - 60
+    in_min = sum(1 for t in _recent_comment_times if t >= cutoff_min)
+    if in_min >= GLOBAL_PER_MIN:
+        return False, f'global {in_min}/min'
+    cutoff_hour = now - 3600
+    in_hour = sum(1 for t in _recent_comment_times if t >= cutoff_hour)
+    if in_hour >= GLOBAL_PER_HOUR:
+        return False, f'global {in_hour}/hour'
+    return True, ''
+
+def _record_comment(channel_id):
+    now = time.time()
+    _last_comment_per_channel[channel_id] = now
+    _recent_comment_times.append(now)
 
 state_file = "kick_state.json"
 kick_enabled = False
@@ -1563,6 +1597,11 @@ async def auto_comment(event):
         if not await _channel_has_discussion(event.chat_id):
             return
 
+        # Анти-спам: не комментим если per-channel cooldown или global rate hit
+        can, _reason = _can_comment(event.chat_id)
+        if not can:
+            return
+
         await asyncio.sleep(random.uniform(1.2, 2.5))
         comment = random.choice(COMMENTS)
         await asyncio.sleep(random.uniform(0.4, 0.9))
@@ -1574,9 +1613,14 @@ async def auto_comment(event):
                     message=comment,
                     comment_to=event.id
                 )
+                _record_comment(event.chat_id)
                 return
             except errors.FloodWaitError as e:
-                await asyncio.sleep(max(e.seconds, 5) + random.uniform(1, 3))
+                # FloodWait: блочим этот канал на длину паузы — Telegram явно
+                # сказал «слишком быстро». Плюс джиттер сверху.
+                wait_s = max(e.seconds, 5)
+                _last_comment_per_channel[event.chat_id] = time.time() + wait_s
+                await asyncio.sleep(wait_s + random.uniform(1, 3))
             except errors.RPCError as e:
                 err_str = str(e).lower()
                 if 'message id' in err_str and 'invalid' in err_str:
