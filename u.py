@@ -1852,7 +1852,55 @@ async def on_stop():
     if monitor_task:
         monitor_task.cancel()
 
+#
+# KEEPALIVE HTTP-СЕРВЕР
+# Render free web service требует открытый порт ($PORT) и засыпает без
+# входящего HTTP-трафика. Отдаём 200 на любой запрос и сами себя пингуем
+# по RENDER_EXTERNAL_URL, чтобы сервис не уходил в сон.
+#
+
+def _start_keepalive():
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import threading
+    import urllib.request
+
+    port = int(os.getenv('PORT', '10000'))
+
+    class _H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'ok')
+
+        def do_HEAD(self):
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    try:
+        srv = HTTPServer(('0.0.0.0', port), _H)
+    except OSError as e:
+        print(f'keepalive: не удалось занять порт {port}: {e}')
+        return
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    print(f'keepalive HTTP на :{port}')
+
+    url = os.getenv('RENDER_EXTERNAL_URL')
+    if url:
+        def _ping():
+            while True:
+                time.sleep(600)
+                try:
+                    urllib.request.urlopen(url, timeout=15).read()
+                except Exception:
+                    pass
+        threading.Thread(target=_ping, daemon=True).start()
+        print(f'самопинг {url} каждые 10 мин')
+
 if __name__ == '__main__':
+    _start_keepalive()
     with client:
         client.loop.run_until_complete(main())
         try:
