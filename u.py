@@ -230,6 +230,10 @@ def _record_comment(channel_id):
 state_file = "kick_state.json"
 kick_enabled = False
 gs_enabled = False
+font_enabled = False
+# Обход авто-шрифта для исходящих, которые шлёт сам код (автокомменты и т.п.)
+_font_bypass = False
+_font_skip_ids = set()
 baseline_hashes = set()
 monitor_task = None
 
@@ -551,26 +555,33 @@ def clean(t):
 # 
 
 async def load_kick_state():
-    """Загружает состояние автокика."""
-    global kick_enabled, baseline_hashes, gs_enabled
+    """Загружает состояние автокика / гс / шрифта."""
+    global kick_enabled, baseline_hashes, gs_enabled, font_enabled
     if os.path.exists(state_file):
         try:
             with open(state_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 kick_enabled = bool(data.get("kick_enabled", False))
                 gs_enabled = bool(data.get("gs_enabled", False))
+                font_enabled = bool(data.get("font_enabled", False))
                 baseline_hashes = set(data.get("baseline_hashes", []))
         except Exception:
             kick_enabled = False
             gs_enabled = False
+            font_enabled = False
             baseline_hashes = set()
 
 async def save_kick_state():
-    """Сохраняет состояние автокика."""
-    global kick_enabled, baseline_hashes, gs_enabled
+    """Сохраняет состояние автокика / гс / шрифта."""
+    global kick_enabled, baseline_hashes, gs_enabled, font_enabled
     try:
         with open(state_file, "w", encoding="utf-8") as f:
-            json.dump({"kick_enabled": bool(kick_enabled), "gs_enabled": bool(gs_enabled), "baseline_hashes": list(baseline_hashes)}, f)
+            json.dump({
+                "kick_enabled": bool(kick_enabled),
+                "gs_enabled": bool(gs_enabled),
+                "font_enabled": bool(font_enabled),
+                "baseline_hashes": list(baseline_hashes),
+            }, f)
     except Exception:
         pass
 
@@ -696,6 +707,82 @@ async def cmd_gs_off(event):
     gs_enabled = False
     await save_kick_state()
     await event.reply("Транскрибация голосовых выключена")
+
+
+# 
+# АВТО-ШРИФТ (Telegram formatting: bold)
+# Bot API Rich Messages (sendRichMessage) — только для ботов.
+# У юзербота доступны обычные MessageEntity: bold/italic/… через parse_mode.
+# Автокомменты под постами не трогаем (_font_bypass).
+#
+
+def _apply_font_markup(text: str) -> str:
+    """Оборачивает текст в HTML bold (работает с кириллицей)."""
+    return f'<b>{html.escape(text)}</b>'
+
+
+@client.on(events.NewMessage(pattern=r'^\.fon$', outgoing=True))
+async def cmd_font_on(event):
+    """Включает авто-шрифт (bold) для исходящих сообщений."""
+    if event.sender_id != OWNER_ID:
+        return
+    global font_enabled
+    if font_enabled:
+        await event.reply("Шрифт уже включён")
+        return
+    font_enabled = True
+    await save_kick_state()
+    await event.reply("Шрифт включён — твои сообщения будут жирными")
+
+
+@client.on(events.NewMessage(pattern=r'^\.foff$', outgoing=True))
+async def cmd_font_off(event):
+    """Выключает авто-шрифт."""
+    if event.sender_id != OWNER_ID:
+        return
+    global font_enabled
+    if not font_enabled:
+        await event.reply("Шрифт уже выключен")
+        return
+    font_enabled = False
+    await save_kick_state()
+    await event.reply("Шрифт выключен")
+
+
+@client.on(events.NewMessage(outgoing=True))
+async def handle_auto_font(event):
+    """Переписывает исходящий текст жирным, если шрифт включён.
+
+    Не применяется к:
+      - командам (сообщения на «.»)
+      - программным исходящим (_font_bypass / _font_skip_ids), в т.ч. автокомментам
+      - пустым / без текста
+    """
+    global _font_skip_ids
+    if event.sender_id != OWNER_ID:
+        return
+    if event.id in _font_skip_ids:
+        _font_skip_ids.discard(event.id)
+        return
+    if not font_enabled or _font_bypass:
+        return
+    text = getattr(event.message, 'message', None) or ''
+    if not text or not text.strip():
+        return
+    if text.strip().startswith('.'):
+        return
+    # Уже есть разметка (кастом эмодзи, ссылки и т.п.) — не ломаем
+    if getattr(event.message, 'entities', None):
+        return
+    # Запасной фильтр: фразы из пула автокомментов не стилизуем
+    if text.strip() in COMMENTS:
+        return
+    styled = _apply_font_markup(text)
+    try:
+        await event.edit(styled, parse_mode='html')
+    except Exception:
+        pass
+
 
 def _transcribe_sync(voice_bytes: bytes) -> str | None:
     """Синхронная транскрибация через faster-whisper (запускается в executor)."""
@@ -1608,11 +1695,18 @@ async def auto_comment(event):
 
         for attempt in range(2):
             try:
-                await client.send_message(
-                    entity=event.chat_id,
-                    message=comment,
-                    comment_to=event.id
-                )
+                global _font_bypass, _font_skip_ids
+                _font_bypass = True
+                try:
+                    sent = await client.send_message(
+                        entity=event.chat_id,
+                        message=comment,
+                        comment_to=event.id
+                    )
+                    if sent is not None and getattr(sent, 'id', None):
+                        _font_skip_ids.add(sent.id)
+                finally:
+                    _font_bypass = False
                 _record_comment(event.chat_id)
                 return
             except errors.FloodWaitError as e:
@@ -1801,6 +1895,10 @@ async def cmd_help(event):
         "ТРАНСКРИБАЦИЯ ГОЛОСОВЫХ:\n"
         "  .gn                включить (авто для всех гс)\n"
         "  .gf                выключить\n\n"
+        "ШРИФТ (жирный текст):\n"
+        "  .fon               включить авто-жирный для твоих сообщений\n"
+        "  .foff              выключить\n"
+        "  (автокомменты под постами не затрагивает)\n\n"
         "  .kick              включить автокик\n"
         "  .kickf             выключить\n\n"
         " .help             эта справка\n"
@@ -1828,6 +1926,7 @@ async def main():
     # Загрузка состояния автокика
     await load_kick_state()
     print(f' Состояние автокика: {"ВКЛ" if kick_enabled else "ВЫКЛ"}')
+    print(f' Шрифт: {"ВКЛ" if font_enabled else "ВЫКЛ"}')
     
     # Запуск фоновой задачи автоочистки
     autoclean_task = asyncio.create_task(autoclean_loop())
