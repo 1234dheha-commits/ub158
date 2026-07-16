@@ -251,6 +251,13 @@ _rich_skip_ids = set()
 # Тег стиля, которым оборачивается текст перед отправкой боту:
 # None -> обычный (.sh1), 'h3' -> <h3>текст</h3> (.sh2)
 _rich_style_tag = None
+_rich_last_error_ts = 0
+
+# Автобан новых номеров не из гео Украины/России + анонимных номеров (.ban/.banf)
+# По умолчанию включен.
+ban_enabled = True
+# Разрешённые телефонные префиксы (без "+"): Украина, Россия (код 7 общий с Казахстаном)
+ALLOWED_PHONE_PREFIXES = ('380', '7')
 
 MAX_BANNED_CACHE = 1000
 banned_cache = set()
@@ -273,7 +280,7 @@ def get_db_connection():
     return psycopg2.connect(DATABASE_URL, sslmode='require')
 
 def init_db():
-    """Инициализирует таблицу каналов в БД."""
+    """Инициализирует таблицы в БД (каналы + настройки рантайма)."""
     conn = get_db_connection()
     if not conn:
         return
@@ -285,10 +292,59 @@ def init_db():
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        # Настройки (last_clean, kick_state и т.п.) — в БД, а не в локальном
+        # файле: на Render/Railway диск контейнера эфемерный и очищается на
+        # каждом деплое, из-за чего файл всегда "пустой" после редеплоя и
+        # автоочистка/тумблеры сбрасывались бы каждый раз.
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        ''')
         conn.commit()
     except Exception as e:
         print(f'DB init error: {e}')
         conn.rollback()
+    finally:
+        cur.close()
+        conn.close()
+
+def get_setting(key, default=None):
+    """Читает значение настройки из БД."""
+    conn = get_db_connection()
+    if not conn:
+        return default
+    cur = conn.cursor()
+    try:
+        cur.execute('SELECT value FROM bot_settings WHERE key = %s', (key,))
+        row = cur.fetchone()
+        return row[0] if row else default
+    except Exception as e:
+        print(f'get_setting({key}) error: {e}')
+        return default
+    finally:
+        cur.close()
+        conn.close()
+
+def set_setting(key, value):
+    """Записывает значение настройки в БД."""
+    conn = get_db_connection()
+    if not conn:
+        return False
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            'INSERT INTO bot_settings (key, value) VALUES (%s, %s) '
+            'ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value',
+            (key, value)
+        )
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f'set_setting({key}) error: {e}')
+        conn.rollback()
+        return False
     finally:
         cur.close()
         conn.close()
@@ -353,7 +409,14 @@ def remove_channel_db(channel_id):
 # 
 
 def load_autoclean_state():
-    """Загружает время последней автоочистки."""
+    """Загружает время последней автоочистки (БД — переживает редеплой;
+    локальный файл — только запасной вариант для дев-режима без Postgres)."""
+    if DATABASE_URL:
+        raw = get_setting('last_clean')
+        try:
+            return float(raw) if raw is not None else 0
+        except (TypeError, ValueError):
+            return 0
     if os.path.exists(AUTO_CLEAN_STATE_FILE):
         try:
             with open(AUTO_CLEAN_STATE_FILE, 'r') as f:
@@ -363,7 +426,10 @@ def load_autoclean_state():
     return 0
 
 def save_autoclean_state(ts):
-    """Сохраняет время последней автоочистки."""
+    """Сохраняет время последней автоочистки (БД, иначе локальный файл)."""
+    if DATABASE_URL:
+        set_setting('last_clean', str(ts))
+        return
     try:
         with open(AUTO_CLEAN_STATE_FILE, 'w') as f:
             json.dump({'last_clean': ts}, f)
@@ -570,36 +636,53 @@ def clean(t):
 # 
 
 async def load_kick_state():
-    """Загружает состояние автокика / гс / рич-текста."""
-    global kick_enabled, baseline_hashes, gs_enabled, richtext_enabled, _rich_style_tag
-    if os.path.exists(state_file):
-        try:
+    """Загружает состояние автокика / гс / рич-текста / автобана.
+
+    Источник — БД (переживает редеплой на Render/Railway, где локальный диск
+    контейнера эфемерный); локальный файл — запасной вариант для дев-режима
+    без Postgres (DATABASE_URL не задан).
+    """
+    global kick_enabled, baseline_hashes, gs_enabled, richtext_enabled, _rich_style_tag, ban_enabled
+    data = {}
+    try:
+        if DATABASE_URL:
+            raw = get_setting('kick_state')
+            if raw:
+                data = json.loads(raw)
+        elif os.path.exists(state_file):
             with open(state_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                kick_enabled = bool(data.get("kick_enabled", False))
-                gs_enabled = bool(data.get("gs_enabled", False))
-                richtext_enabled = bool(data.get("richtext_enabled", False))
-                _rich_style_tag = data.get("rich_style_tag") or None
-                baseline_hashes = set(data.get("baseline_hashes", []))
-        except Exception:
-            kick_enabled = False
-            gs_enabled = False
-            richtext_enabled = False
-            _rich_style_tag = None
-            baseline_hashes = set()
+        kick_enabled = bool(data.get("kick_enabled", False))
+        gs_enabled = bool(data.get("gs_enabled", False))
+        richtext_enabled = bool(data.get("richtext_enabled", False))
+        _rich_style_tag = data.get("rich_style_tag") or None
+        ban_enabled = bool(data.get("ban_enabled", True))
+        baseline_hashes = set(data.get("baseline_hashes", []))
+    except Exception:
+        kick_enabled = False
+        gs_enabled = False
+        richtext_enabled = False
+        _rich_style_tag = None
+        ban_enabled = True
+        baseline_hashes = set()
 
 async def save_kick_state():
-    """Сохраняет состояние автокика / гс / рич-текста."""
-    global kick_enabled, baseline_hashes, gs_enabled, richtext_enabled, _rich_style_tag
+    """Сохраняет состояние автокика / гс / рич-текста / автобана (БД, иначе локальный файл)."""
+    global kick_enabled, baseline_hashes, gs_enabled, richtext_enabled, _rich_style_tag, ban_enabled
+    payload = {
+        "kick_enabled": bool(kick_enabled),
+        "gs_enabled": bool(gs_enabled),
+        "richtext_enabled": bool(richtext_enabled),
+        "rich_style_tag": _rich_style_tag,
+        "ban_enabled": bool(ban_enabled),
+        "baseline_hashes": list(baseline_hashes),
+    }
     try:
-        with open(state_file, "w", encoding="utf-8") as f:
-            json.dump({
-                "kick_enabled": bool(kick_enabled),
-                "gs_enabled": bool(gs_enabled),
-                "richtext_enabled": bool(richtext_enabled),
-                "rich_style_tag": _rich_style_tag,
-                "baseline_hashes": list(baseline_hashes),
-            }, f)
+        if DATABASE_URL:
+            set_setting('kick_state', json.dumps(payload))
+        else:
+            with open(state_file, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
     except Exception:
         pass
 
@@ -742,6 +825,29 @@ async def cmd_gs_off(event):
 # при первом обращении архивируется и заглушается, чтобы не мозолил глаза.
 #
 
+async def _debug_notify(context: str, err):
+    """Шлёт владельцу в Избранное короткую диагностику при сбое рич-текста.
+
+    Раньше все ошибки этого пайплайна тихо глотались (except: pass/return),
+    из-за чего было не видно, ПОЧЕМУ сообщение не менялось. Не чаще раза в
+    30 секунд, чтобы не заспамить при повторяющейся ошибке.
+    """
+    global _rich_last_error_ts, _rich_bypass
+    now = time.time()
+    if now - _rich_last_error_ts < 30:
+        return
+    _rich_last_error_ts = now
+    print(f'[richtext] {context}: {err}')
+    _rich_bypass = True
+    try:
+        msg = await client.send_message(OWNER_ID, f"Рич-текст: сбой на этапе «{context}»:\n{err}")
+        asyncio.create_task(_delete_after(msg, 180))
+    except Exception:
+        pass
+    finally:
+        _rich_bypass = False
+
+
 async def _prepare_richbot_dialog(bot_entity):
     """Архивирует и заглушает чат с ботом (один раз)."""
     global _richbot_prepared
@@ -875,7 +981,8 @@ async def handle_richtext(event):
         return
     try:
         bot_entity = await _get_richbot_entity()
-    except Exception:
+    except Exception as e:
+        await _debug_notify('резолв @Text2RichBot', e)
         return
     if bot_entity is None:
         return
@@ -887,14 +994,113 @@ async def handle_richtext(event):
         pass
     try:
         result_text, result_entities = await _convert_via_richbot(text)
-    except Exception:
+    except Exception as e:
+        await _debug_notify('запрос к @Text2RichBot', e)
         return
     if not result_text:
         return
     try:
         await event.message.edit(result_text, formatting_entities=result_entities)
+    except Exception as e:
+        await _debug_notify('edit сообщения', e)
+
+
+#
+# АВТОБАН НОВЫХ НОМЕРОВ НЕ ИЗ UA/RU
+# .ban  — включает (по умолчанию уже включено).
+# .banf — выключает.
+# Срабатывает только на ПЕРВОЕ сообщение от нового собеседника в личке:
+# если номер телефона не виден (скрыт приватностью — считаем «анонимным»)
+# или не начинается с +380/+7 — юзербот блокирует и удаляет переписку,
+# отчёт (кто и что написал) уходит в Избранное и не удаляется. Если
+# собеседник уже писал раньше — не трогаем вообще, независимо от номера.
+#
+
+def _phone_is_allowed(phone) -> bool:
+    """True, если номер виден и относится к разрешённому гео (UA/RU)."""
+    phone = (phone or '').lstrip('+')
+    if not phone:
+        return False
+    return any(phone.startswith(p) for p in ALLOWED_PHONE_PREFIXES)
+
+
+@client.on(events.NewMessage(pattern=r'^\.ban$', outgoing=True))
+async def cmd_autoban_on(event):
+    """Включает автобан новых номеров не из UA/RU."""
+    if event.sender_id != OWNER_ID:
+        return
+    global ban_enabled
+    if ban_enabled:
+        await event.reply("Автобан номеров уже включен")
+        return
+    ban_enabled = True
+    await save_kick_state()
+    await event.reply("Автобан номеров включен")
+
+
+@client.on(events.NewMessage(pattern=r'^\.banf$', outgoing=True))
+async def cmd_autoban_off(event):
+    """Выключает автобан новых номеров не из UA/RU."""
+    if event.sender_id != OWNER_ID:
+        return
+    global ban_enabled
+    if not ban_enabled:
+        await event.reply("Автобан номеров уже выключен")
+        return
+    ban_enabled = False
+    await save_kick_state()
+    await event.reply("Автобан номеров выключен")
+
+
+@client.on(events.NewMessage(incoming=True))
+async def handle_autoban_numbers(event):
+    """Банит новых собеседников в личке с номером не из UA/RU (или скрытым)."""
+    if not ban_enabled:
+        return
+    if not event.is_private:
+        return
+    try:
+        sender = await event.get_sender()
     except Exception:
-        pass
+        return
+    if sender is None or getattr(sender, 'bot', False) or getattr(sender, 'is_self', False):
+        return
+    # Уже переписывались раньше (в любую сторону) — не трогаем
+    try:
+        prior = await client.get_messages(event.chat_id, limit=1, offset_id=event.id)
+    except Exception:
+        return
+    if prior:
+        return
+    phone = getattr(sender, 'phone', None)
+    if _phone_is_allowed(phone):
+        return
+    name = utils.get_display_name(sender)
+    username = f'@{sender.username}' if getattr(sender, 'username', None) else '—'
+    report = (
+        f'Автобан по номеру\n'
+        f'Кто: {name} ({username}, id {sender.id})\n'
+        f'Номер: {phone or "скрыт/анонимный"}\n'
+        f'Написал: {event.raw_text or "[медиа/без текста]"}'
+    )
+    try:
+        await client(functions.contacts.BlockRequest(id=sender))
+    except Exception as e:
+        print(f'[autoban] block error: {e}')
+    try:
+        await client(functions.messages.DeleteHistoryRequest(peer=sender, max_id=0, revoke=True))
+    except Exception as e:
+        print(f'[autoban] delete history error: {e}')
+    global _rich_bypass, _rich_skip_ids
+    _rich_bypass = True
+    try:
+        sent = await client.send_message(OWNER_ID, report)
+        if sent is not None and getattr(sent, 'id', None):
+            _rich_skip_ids.add(sent.id)
+    except Exception as e:
+        print(f'[autoban] report error: {e}')
+    finally:
+        _rich_bypass = False
 
 
 def _transcribe_sync(voice_bytes: bytes) -> str | None:
@@ -1808,14 +2014,16 @@ async def auto_comment(event):
 
         for attempt in range(2):
             try:
-                global _rich_bypass
+                global _rich_bypass, _rich_skip_ids
                 _rich_bypass = True
                 try:
-                    await client.send_message(
+                    sent = await client.send_message(
                         entity=event.chat_id,
                         message=comment,
                         comment_to=event.id
                     )
+                    if sent is not None and getattr(sent, 'id', None):
+                        _rich_skip_ids.add(sent.id)
                 finally:
                     _rich_bypass = False
                 _record_comment(event.chat_id)
@@ -2013,6 +2221,9 @@ async def cmd_help(event):
         "  .sh2               шрифт h3\n"
         "  (команды, автокомменты и уже отформатированное не трогает;\n"
         "   подписи под фото/видео конвертируются тоже)\n\n"
+        "АВТОБАН НОМЕРОВ (не UA/RU + анонимные, только новые диалоги):\n"
+        "  .ban               включить (по умолчанию уже включено)\n"
+        "  .banf              выключить\n\n"
         "  .kick              включить автокик\n"
         "  .kickf             выключить\n\n"
         " .help             эта справка\n"
@@ -2041,6 +2252,7 @@ async def main():
     await load_kick_state()
     print(f' Состояние автокика: {"ВКЛ" if kick_enabled else "ВЫКЛ"}')
     print(f' Рич-текст: {"ВКЛ" if richtext_enabled else "ВЫКЛ"}')
+    print(f' Автобан номеров: {"ВКЛ" if ban_enabled else "ВЫКЛ"}')
 
     # Запуск фоновой задачи автоочистки
     autoclean_task = asyncio.create_task(autoclean_loop())
