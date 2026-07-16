@@ -22,7 +22,7 @@ from telethon.tl.functions.folders import EditPeerFoldersRequest
 from telethon.tl.functions.account import UpdateNotifySettingsRequest
 from telethon.tl.types import (
     ChatBannedRights, MessageEntityCustomEmoji, PeerChannel, PeerChat,
-    InputFolderPeer, InputNotifyPeer, InputPeerNotifySettings,
+    InputFolderPeer, InputNotifyPeer, InputPeerNotifySettings, InputRichMessageHTML,
 )
 import psycopg2
 from concurrent.futures import ThreadPoolExecutor
@@ -904,8 +904,110 @@ async def _get_richbot_entity():
     return _richbot_entity_cache
 
 
+# Ответ Text2RichBot приходит не обычным текстом, а через отдельное поле
+# rich_message (новая система Telegram "Rich Message": HTML/Markdown на входе
+# -> дерево блоков TypePageBlock на выходе, та же модель что у Telegraph).
+# Ниже — конвертер этих блоков обратно в HTML, чтобы отправить его же через
+# EditMessageRequest(rich_message=InputRichMessageHTML(...)) при правке.
+
+_RICHTEXT_TAG_HTML = {
+    'TextBold': 'b', 'TextItalic': 'i', 'TextUnderline': 'u',
+    'TextStrike': 's', 'TextFixed': 'code', 'TextMarked': 'b',
+    'TextSubscript': 'sub', 'TextSuperscript': 'sup',
+}
+
+_HEADING_BLOCK_TAGS = {
+    'PageBlockHeading1': 'h1', 'PageBlockHeading2': 'h2', 'PageBlockHeading3': 'h3',
+    'PageBlockHeading4': 'h4', 'PageBlockHeading5': 'h5', 'PageBlockHeading6': 'h6',
+    'PageBlockTitle': 'h1', 'PageBlockHeader': 'h2', 'PageBlockSubheader': 'h3',
+    'PageBlockSubtitle': 'h4',
+}
+
+
+def _richtext_to_html(rt) -> str:
+    """Рекурсивно рендерит дерево TypeRichText в HTML."""
+    if rt is None:
+        return ''
+    cls = type(rt).__name__
+    if cls == 'TextPlain':
+        return html.escape(rt.text or '')
+    if cls == 'TextConcat':
+        return ''.join(_richtext_to_html(t) for t in (rt.texts or []))
+    if cls in _RICHTEXT_TAG_HTML:
+        tag = _RICHTEXT_TAG_HTML[cls]
+        return f'<{tag}>{_richtext_to_html(rt.text)}</{tag}>'
+    if cls == 'TextUrl':
+        return f'<a href="{html.escape(rt.url or "")}">{_richtext_to_html(rt.text)}</a>'
+    if cls == 'TextEmail':
+        return f'<a href="mailto:{html.escape(rt.email or "")}">{_richtext_to_html(rt.text)}</a>'
+    if cls in ('TextAnchor', 'TextPhone'):
+        return _richtext_to_html(getattr(rt, 'text', None))
+    if cls in ('TextEmpty', 'TextImage'):
+        return ''
+    # Неизвестный тип — берём вложенный .text, если есть
+    return _richtext_to_html(getattr(rt, 'text', None)) if hasattr(rt, 'text') else ''
+
+
+def _richtext_plain(rt) -> str:
+    """Рекурсивно достаёт чистый текст без разметки (фоллбек для message=)."""
+    if rt is None:
+        return ''
+    cls = type(rt).__name__
+    if cls == 'TextPlain':
+        return rt.text or ''
+    if cls == 'TextConcat':
+        return ''.join(_richtext_plain(t) for t in (rt.texts or []))
+    if hasattr(rt, 'text'):
+        return _richtext_plain(rt.text)
+    return ''
+
+
+def _page_block_to_html(block) -> str:
+    cls = type(block).__name__
+    if cls in _HEADING_BLOCK_TAGS:
+        tag = _HEADING_BLOCK_TAGS[cls]
+        return f'<{tag}>{_richtext_to_html(block.text)}</{tag}>'
+    if cls == 'PageBlockParagraph':
+        return f'<p>{_richtext_to_html(block.text)}</p>'
+    if cls in ('PageBlockBlockquote', 'PageBlockPullquote'):
+        return f'<blockquote>{_richtext_to_html(block.text)}</blockquote>'
+    if cls == 'PageBlockPreformatted':
+        return f'<pre>{_richtext_to_html(block.text)}</pre>'
+    if cls in ('PageBlockKicker', 'PageBlockFooter', 'PageBlockAuthorDate'):
+        return f'<p>{_richtext_to_html(block.text)}</p>'
+    if cls in ('PageBlockList', 'PageBlockOrderedList'):
+        tag = 'ol' if cls == 'PageBlockOrderedList' else 'ul'
+        items = ''.join(
+            f'<li>{_richtext_to_html(getattr(it, "text", None))}</li>'
+            for it in (block.items or []) if hasattr(it, 'text')
+        )
+        return f'<{tag}>{items}</{tag}>' if items else ''
+    if cls == 'PageBlockDivider':
+        return '<br>'
+    # Медиа/неподдерживаемые блоки (фото, таблицы, embed и т.п.) — пропускаем,
+    # текст важнее, чем эти вложения, которые мы всё равно не можем скопировать.
+    return ''
+
+
+def _rich_message_to_html(rich_message) -> str:
+    blocks = getattr(rich_message, 'blocks', None) or []
+    return ''.join(_page_block_to_html(b) for b in blocks)
+
+
+def _rich_message_to_plain(rich_message) -> str:
+    blocks = getattr(rich_message, 'blocks', None) or []
+    parts = [_richtext_plain(getattr(b, 'text', None)) for b in blocks if hasattr(b, 'text')]
+    return '\n'.join(p for p in parts if p)
+
+
 async def _ask_richbot(bot_entity, payload: str):
-    """Один запрос-ответ боту. Возвращает (текст, entities) или (None, None)."""
+    """Один запрос-ответ боту.
+
+    Возвращает (текст, entities, rich_html):
+      - если бот ответил обычным текстом — (текст, entities, None);
+      - если бот ответил через rich_message — (текст-фоллбек, None, html);
+      - если ответа по существу нет — (None, None, None).
+    """
     global _rich_bypass, _rich_skip_ids
     async with _rich_lock:
         _rich_bypass = True
@@ -919,14 +1021,20 @@ async def _ask_richbot(bot_entity, payload: str):
                     _rich_skip_ids.add(sent.id)
                 resp = await conv.get_response()
                 rich = getattr(resp, 'rich_message', None)
-                media = getattr(resp, 'media', None)
-                print(f'[richtext] получил от бота id={resp.id}: msg={(resp.message or "")[:60]!r} entities={len(resp.entities or [])} rich_message={rich!r} media={media!r}'[:600])
+                print(f'[richtext] получил от бота id={resp.id}: msg={(resp.message or "")[:60]!r} entities={len(resp.entities or [])} rich_message={"есть" if rich else "нет"}')
         finally:
             _rich_bypass = False
+    if rich is not None:
+        rich_html = _rich_message_to_html(rich)
+        plain = _rich_message_to_plain(rich)
+        print(f'[richtext] rich_message -> html: {rich_html[:120]!r}')
+        if not rich_html.strip() and not plain.strip():
+            return None, None, None
+        return (plain or 'ㅤ'), None, rich_html
     result_text = resp.raw_text if resp.raw_text else resp.message
     if not result_text or not result_text.strip():
-        return None, None
-    return result_text, resp.entities
+        return None, None, None
+    return result_text, resp.entities, None
 
 
 async def _convert_via_richbot(text: str):
@@ -938,11 +1046,11 @@ async def _convert_via_richbot(text: str):
     """
     bot_entity = await _get_richbot_entity()
     payload = f'<{_rich_style_tag}>{text}</{_rich_style_tag}>' if _rich_style_tag else text
-    result_text, result_entities = await _ask_richbot(bot_entity, payload)
+    result_text, result_entities, rich_html = await _ask_richbot(bot_entity, payload)
     if not result_text and _rich_style_tag:
         print(f'[richtext] пустой ответ на <{_rich_style_tag}>, повторяю без обёртки')
-        result_text, result_entities = await _ask_richbot(bot_entity, text)
-    return result_text, result_entities
+        result_text, result_entities, rich_html = await _ask_richbot(bot_entity, text)
+    return result_text, result_entities, rich_html
 
 
 @client.on(events.NewMessage(pattern=r'^\.on$', outgoing=True))
@@ -1036,17 +1144,30 @@ async def handle_richtext(event):
     except Exception:
         pass
     try:
-        result_text, result_entities = await _convert_via_richbot(text)
+        result_text, result_entities, rich_html = await _convert_via_richbot(text)
     except Exception as e:
         print(f'[richtext] запрос к боту упал: {e!r}')
         await _debug_notify('запрос к @Text2RichBot', e)
         return
-    print(f'[richtext] ответ бота: {result_text[:60]!r} entities={len(result_entities or [])}' if result_text else '[richtext] пустой ответ бота')
     if not result_text:
+        print('[richtext] пустой ответ бота')
         return
+    print(f'[richtext] ответ бота: {result_text[:60]!r} entities={len(result_entities or [])} rich_html={bool(rich_html)}')
     try:
-        edited = await event.message.edit(result_text, formatting_entities=result_entities)
-        print(f'[richtext] edit OK, новый message.id={getattr(edited, "id", "?")}')
+        if rich_html:
+            # Telethon's edit()/edit_message() не пробрасывают rich_message —
+            # шлём сырой запрос напрямую.
+            peer = await client.get_input_entity(event.chat_id)
+            await client(functions.messages.EditMessageRequest(
+                peer=peer,
+                id=event.message.id,
+                message=result_text,
+                rich_message=InputRichMessageHTML(html=rich_html),
+            ))
+            print('[richtext] edit (rich_message) OK')
+        else:
+            edited = await event.message.edit(result_text, formatting_entities=result_entities)
+            print(f'[richtext] edit OK, новый message.id={getattr(edited, "id", "?")}')
     except Exception as e:
         print(f'[richtext] edit упал: {e!r}')
         await _debug_notify('edit сообщения', e)
