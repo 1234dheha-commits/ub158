@@ -1174,6 +1174,7 @@ async def handle_richtext(event):
         print('[richtext] пустой ответ бота')
         return
     print(f'[richtext] ответ бота: {result_text[:60]!r} entities={len(result_entities or [])} rich_html={bool(rich_html)}')
+    protected_chat = bool(getattr(event.message, 'noforwards', False))
     try:
         if rich_html:
             # Telethon's edit()/edit_message() не пробрасывают rich_message —
@@ -1188,10 +1189,13 @@ async def handle_richtext(event):
                 # На подписях под фото/видео Telegram иногда считает правку
                 # "без изменений" (сверяет только classic-текст, который
                 # часто совпадает с исходным — rich_message при этом другой),
-                # если явно не переуказать текущее медиа. Форсируем это.
+                # если явно не переуказать текущее медиа. Форсируем это —
+                # но НЕ в чатах с защитой контента (там повторное
+                # прикрепление медиа сервер трактует как копирование и
+                # блокирует с ChatForwardsRestrictedError).
                 media = getattr(event.message, 'media', None)
                 media_input = None
-                if media:
+                if media and not protected_chat:
                     try:
                         media_input = utils.get_input_media(media)
                     except Exception:
@@ -1206,11 +1210,23 @@ async def handle_richtext(event):
         else:
             edited = await event.message.edit(result_text, formatting_entities=result_entities)
             print(f'[richtext] edit OK, новый message.id={getattr(edited, "id", "?")}')
+    except errors.ChatForwardsRestrictedError:
+        print('[richtext] чат с защитой контента — рич-форматирование здесь недоступно, оставляю обычный текст')
+        try:
+            await event.message.edit(result_text)
+            print('[richtext] fallback plain edit OK (protected chat)')
+        except errors.MessageNotModifiedError:
+            pass  # бот вернул тот же текст — менять нечего
+        except Exception as e2:
+            print(f'[richtext] fallback edit (protected) тоже упал: {e2!r}')
+            await _debug_notify('этот чат защищён от копирования — рич-текст недоступен', e2)
     except Exception as e:
         print(f'[richtext] edit (rich) упал: {e!r}, пробую обычную правку без форматирования')
         try:
             await event.message.edit(result_text)
             print('[richtext] fallback plain edit OK')
+        except errors.MessageNotModifiedError:
+            pass
         except Exception as e2:
             print(f'[richtext] fallback edit тоже упал: {e2!r}')
             await _debug_notify('edit сообщения', e2)
