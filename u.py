@@ -904,16 +904,9 @@ async def _get_richbot_entity():
     return _richbot_entity_cache
 
 
-async def _convert_via_richbot(text: str):
-    """Отправляет текст боту и возвращает (текст, entities) его ответа.
-
-    Захватывает _rich_lock, т.к. диалог с ботом идёт в одном чате — если не
-    сериализовать запросы, параллельные конвертации перепутают ответы между
-    собой.
-    """
+async def _ask_richbot(bot_entity, payload: str):
+    """Один запрос-ответ боту. Возвращает (текст, entities) или (None, None)."""
     global _rich_bypass, _rich_skip_ids
-    bot_entity = await _get_richbot_entity()
-    payload = f'<{_rich_style_tag}>{text}</{_rich_style_tag}>' if _rich_style_tag else text
     async with _rich_lock:
         _rich_bypass = True
         try:
@@ -932,6 +925,22 @@ async def _convert_via_richbot(text: str):
     if not result_text or not result_text.strip():
         return None, None
     return result_text, resp.entities
+
+
+async def _convert_via_richbot(text: str):
+    """Отправляет текст боту (с учётом стиля .sh1/.sh2) и возвращает ответ.
+
+    Если обёрнутый тегом стиля запрос вернул пустой ответ (бот не понял
+    синтаксис тега — так и было на практике с <h3>), пробуем ещё раз
+    обычным текстом без обёртки, чтобы .sh2 не превращался в тишину.
+    """
+    bot_entity = await _get_richbot_entity()
+    payload = f'<{_rich_style_tag}>{text}</{_rich_style_tag}>' if _rich_style_tag else text
+    result_text, result_entities = await _ask_richbot(bot_entity, payload)
+    if not result_text and _rich_style_tag:
+        print(f'[richtext] пустой ответ на <{_rich_style_tag}>, повторяю без обёртки')
+        result_text, result_entities = await _ask_richbot(bot_entity, text)
+    return result_text, result_entities
 
 
 @client.on(events.NewMessage(pattern=r'^\.on$', outgoing=True))
