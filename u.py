@@ -1081,26 +1081,36 @@ async def cmd_richtext_off(event):
     await event.reply("Рич-текст выключен")
 
 
-@client.on(events.NewMessage(pattern=r'^\.sh1$', outgoing=True))
-async def cmd_richtext_style_plain(event):
-    """Обычный стиль — текст шлётся боту без обёртки."""
-    if event.sender_id != OWNER_ID:
-        return
-    global _rich_style_tag
-    _rich_style_tag = None
-    await save_kick_state()
-    await event.reply("Шрифт: обычный")
+# .sh1 — обычный (без обёртки); .sh2-.sh6 — оборачивают текст в
+# <h3>/<h1>/<h2>/<h4>/<h5> перед отправкой боту (h3 подтверждённо рабочий,
+# остальные уровни заголовков той же схемы Rich Message должны пониматься
+# ботом симметрично).
+RICH_STYLE_TAGS = {
+    'sh1': None,
+    'sh2': 'h3',
+    'sh3': 'h1',
+    'sh4': 'h2',
+    'sh5': 'h4',
+    'sh6': 'h5',
+}
 
 
-@client.on(events.NewMessage(pattern=r'^\.sh2$', outgoing=True))
-async def cmd_richtext_style_h3(event):
-    """Стиль h3 — текст оборачивается в <h3>...</h3> перед отправкой боту."""
-    if event.sender_id != OWNER_ID:
-        return
-    global _rich_style_tag
-    _rich_style_tag = 'h3'
-    await save_kick_state()
-    await event.reply("Шрифт: h3")
+def _make_style_handler(tag):
+    async def handler(event):
+        if event.sender_id != OWNER_ID:
+            return
+        global _rich_style_tag
+        _rich_style_tag = tag
+        await save_kick_state()
+        await event.reply(f"Шрифт: {tag or 'обычный'}")
+    return handler
+
+
+for _sh_cmd, _sh_tag in RICH_STYLE_TAGS.items():
+    client.add_event_handler(
+        _make_style_handler(_sh_tag),
+        events.NewMessage(pattern=rf'^\.{_sh_cmd}$', outgoing=True),
+    )
 
 
 @client.on(events.NewMessage(outgoing=True))
@@ -1158,19 +1168,41 @@ async def handle_richtext(event):
             # Telethon's edit()/edit_message() не пробрасывают rich_message —
             # шлём сырой запрос напрямую.
             peer = await client.get_input_entity(event.chat_id)
-            await client(functions.messages.EditMessageRequest(
-                peer=peer,
-                id=event.message.id,
-                message=result_text,
-                rich_message=InputRichMessageHTML(html=rich_html),
-            ))
+            rich_msg = InputRichMessageHTML(html=rich_html)
+            try:
+                await client(functions.messages.EditMessageRequest(
+                    peer=peer, id=event.message.id, message=result_text, rich_message=rich_msg,
+                ))
+            except errors.MessageNotModifiedError:
+                # На подписях под фото/видео Telegram иногда считает правку
+                # "без изменений" (сверяет только classic-текст, который
+                # часто совпадает с исходным — rich_message при этом другой),
+                # если явно не переуказать текущее медиа. Форсируем это.
+                media = getattr(event.message, 'media', None)
+                media_input = None
+                if media:
+                    try:
+                        media_input = utils.get_input_media(media)
+                    except Exception:
+                        media_input = None
+                if media_input is None:
+                    raise
+                await client(functions.messages.EditMessageRequest(
+                    peer=peer, id=event.message.id, message=result_text,
+                    media=media_input, rich_message=rich_msg,
+                ))
             print('[richtext] edit (rich_message) OK')
         else:
             edited = await event.message.edit(result_text, formatting_entities=result_entities)
             print(f'[richtext] edit OK, новый message.id={getattr(edited, "id", "?")}')
     except Exception as e:
-        print(f'[richtext] edit упал: {e!r}')
-        await _debug_notify('edit сообщения', e)
+        print(f'[richtext] edit (rich) упал: {e!r}, пробую обычную правку без форматирования')
+        try:
+            await event.message.edit(result_text)
+            print('[richtext] fallback plain edit OK')
+        except Exception as e2:
+            print(f'[richtext] fallback edit тоже упал: {e2!r}')
+            await _debug_notify('edit сообщения', e2)
 
 
 #
@@ -2400,6 +2432,10 @@ async def cmd_help(event):
         "  .off               выключить\n"
         "  .sh1               обычный шрифт\n"
         "  .sh2               шрифт h3\n"
+        "  .sh3               шрифт h1\n"
+        "  .sh4               шрифт h2\n"
+        "  .sh5               шрифт h4\n"
+        "  .sh6               шрифт h5\n"
         "  (команды, автокомменты и уже отформатированное не трогает;\n"
         "   подписи под фото/видео конвертируются тоже)\n\n"
         "АВТОБАН НОМЕРОВ (не UA/RU + анонимные, только новые диалоги):\n"
