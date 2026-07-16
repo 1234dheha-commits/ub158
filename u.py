@@ -1171,7 +1171,8 @@ async def _process_richtext(event):
     # Автокомментарии под постами не конвертируем
     if text.strip() in COMMENTS:
         return
-    print(f'[richtext] обрабатываю сообщение id={event.id}: {text[:60]!r}')
+    media_kind = type(getattr(event.message, 'media', None)).__name__
+    print(f'[richtext] обрабатываю сообщение id={event.id} chat={event.chat_id} media={media_kind} is_edit={type(event).__name__}: {text[:60]!r}')
     try:
         bot_entity = await _get_richbot_entity()
     except Exception as e:
@@ -1231,7 +1232,13 @@ async def _process_richtext(event):
                     peer=peer, id=event.message.id, message=result_text,
                     media=media_input, rich_message=rich_msg,
                 ))
-            print('[richtext] edit (rich_message) OK')
+            print(f'[richtext] edit (rich_message) OK, msg id={event.message.id} chat={event.chat_id}')
+            try:
+                check = await client.get_messages(peer, ids=event.message.id)
+                has_rich = bool(getattr(check, 'rich_message', None))
+                print(f'[richtext] проверка после правки: msg={(getattr(check, "message", None) or "")[:60]!r} rich_message={has_rich} media={type(getattr(check, "media", None)).__name__}')
+            except Exception as e:
+                print(f'[richtext] проверка после правки не удалась: {e!r}')
         else:
             edited = await event.message.edit(result_text, formatting_entities=result_entities)
             print(f'[richtext] edit OK, новый message.id={getattr(edited, "id", "?")}')
