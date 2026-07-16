@@ -918,7 +918,9 @@ async def _ask_richbot(bot_entity, payload: str):
                 if sent is not None and getattr(sent, 'id', None):
                     _rich_skip_ids.add(sent.id)
                 resp = await conv.get_response()
-                print(f'[richtext] получил от бота id={resp.id}: {(resp.message or "")[:60]!r} entities={len(resp.entities or [])}')
+                rich = getattr(resp, 'rich_message', None)
+                media = getattr(resp, 'media', None)
+                print(f'[richtext] получил от бота id={resp.id}: msg={(resp.message or "")[:60]!r} entities={len(resp.entities or [])} rich_message={rich!r} media={media!r}'[:600])
         finally:
             _rich_bypass = False
     result_text = resp.raw_text if resp.raw_text else resp.message
