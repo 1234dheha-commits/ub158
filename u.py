@@ -1172,7 +1172,7 @@ async def _process_richtext(event):
     if text.strip() in COMMENTS:
         return
     media_kind = type(getattr(event.message, 'media', None)).__name__
-    print(f'[richtext] обрабатываю сообщение id={event.id} chat={event.chat_id} media={media_kind} is_edit={type(event).__name__}: {text[:60]!r}')
+    print(f'[richtext] обрабатываю сообщение id={event.id} chat={event.chat_id} media={media_kind} src={type(event).__qualname__}: {text[:60]!r}')
     try:
         bot_entity = await _get_richbot_entity()
     except Exception as e:
@@ -1197,7 +1197,6 @@ async def _process_richtext(event):
         print('[richtext] пустой ответ бота')
         return
     print(f'[richtext] ответ бота: {result_text[:60]!r} entities={len(result_entities or [])} rich_html={bool(rich_html)}')
-    protected_chat = bool(getattr(event.message, 'noforwards', False))
     # Наша собственная правка тоже порождает событие MessageEdited — без
     # этого флага она бы зациклилась сама на себя через тот же обработчик.
     _rich_bypass = True
@@ -1207,31 +1206,16 @@ async def _process_richtext(event):
             # шлём сырой запрос напрямую.
             peer = await client.get_input_entity(event.chat_id)
             rich_msg = InputRichMessageHTML(html=rich_html)
-            try:
-                await client(functions.messages.EditMessageRequest(
-                    peer=peer, id=event.message.id, message=result_text, rich_message=rich_msg,
-                ))
-            except errors.MessageNotModifiedError:
-                # На подписях под фото/видео Telegram иногда считает правку
-                # "без изменений" (сверяет только classic-текст, который
-                # часто совпадает с исходным — rich_message при этом другой),
-                # если явно не переуказать текущее медиа. Форсируем это —
-                # но НЕ в чатах с защитой контента (там повторное
-                # прикрепление медиа сервер трактует как копирование и
-                # блокирует с ChatForwardsRestrictedError).
-                media = getattr(event.message, 'media', None)
-                media_input = None
-                if media and not protected_chat:
-                    try:
-                        media_input = utils.get_input_media(media)
-                    except Exception:
-                        media_input = None
-                if media_input is None:
-                    raise
-                await client(functions.messages.EditMessageRequest(
-                    peer=peer, id=event.message.id, message=result_text,
-                    media=media_input, rich_message=rich_msg,
-                ))
+            # Бот часто возвращает то же самое слово без изменений (h3 не
+            # меняет буквы) — тогда classic-текст совпадает с исходным, и
+            # Telegram считает правку "без изменений" (MessageNotModifiedError),
+            # ИГНОРИРУЯ то, что rich_message другой. Проверено и на обычных
+            # сообщениях, и на подписях под фото — переприкрепление медиа
+            # это не лечит. Гарантируем отличие невидимым символом на конце.
+            edit_text = result_text + '⁣'
+            await client(functions.messages.EditMessageRequest(
+                peer=peer, id=event.message.id, message=edit_text, rich_message=rich_msg,
+            ))
             print(f'[richtext] edit (rich_message) OK, msg id={event.message.id} chat={event.chat_id}')
             try:
                 check = await client.get_messages(peer, ids=event.message.id)
