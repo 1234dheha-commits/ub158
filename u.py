@@ -560,6 +560,20 @@ async def _delete_after(message, delay):
     except Exception:
         pass
 
+async def _autodelete5(*messages):
+    """Удаляет команду владельца и ответ(ы) бота через 5 секунд."""
+    await asyncio.sleep(5)
+    for msg in messages:
+        if msg:
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+
+def _cleanup5(event, *replies):
+    """Планирует удаление команды (event.message) и её ответов через 5с."""
+    asyncio.create_task(_autodelete5(event.message, *replies))
+
 async def _delete_later(messages, delay):
     """Удаляет список сообщений через delay секунд."""
     await asyncio.sleep(delay)
@@ -767,7 +781,8 @@ async def cmd_enable(event):
         return
     global kick_enabled, monitor_task, baseline_hashes
     if kick_enabled:
-        await event.reply("Автокик уже включен")
+        resp = await event.reply("успешно")
+        _cleanup5(event, resp)
         return
     loading = await event.reply("Включаю автокик...")
     try:
@@ -779,11 +794,10 @@ async def cmd_enable(event):
         if monitor_task is None or monitor_task.done():
             monitor_task = asyncio.create_task(monitor_sessions())
         await save_kick_state()
-        await loading.edit("Автокик включен")
-        asyncio.create_task(_delete_after(loading, 30))
+        await loading.edit("успешно")
     except Exception as e:
         await loading.edit(f"Ошибка: {e}")
-        asyncio.create_task(_delete_after(loading, 30))
+    _cleanup5(event, loading)
 
 @client.on(events.NewMessage(pattern=r'^\.kickf$', outgoing=True))
 async def cmd_disable(event):
@@ -792,7 +806,8 @@ async def cmd_disable(event):
         return
     global kick_enabled, monitor_task
     if not kick_enabled:
-        await event.reply("Автокик уже выключен")
+        resp = await event.reply("успешно")
+        _cleanup5(event, resp)
         return
     loading = await event.reply("Выключаю автокик...")
     try:
@@ -804,11 +819,10 @@ async def cmd_disable(event):
             except asyncio.CancelledError:
                 pass
         await save_kick_state()
-        await loading.edit("Автокик выключен")
-        asyncio.create_task(_delete_after(loading, 30))
+        await loading.edit("успешно")
     except Exception as e:
         await loading.edit(f"Ошибка: {e}")
-        asyncio.create_task(_delete_after(loading, 30))
+    _cleanup5(event, loading)
 
 @client.on(events.NewMessage(pattern=r'^\.gn$', outgoing=True))
 async def cmd_gs_on(event):
@@ -816,12 +830,10 @@ async def cmd_gs_on(event):
     if event.sender_id != OWNER_ID:
         return
     global gs_enabled
-    if gs_enabled:
-        await event.reply("Транскрибация уже включена")
-        return
     gs_enabled = True
     await save_kick_state()
-    await event.reply("Транскрибация голосовых включена")
+    resp = await event.reply("успешно")
+    _cleanup5(event, resp)
 
 @client.on(events.NewMessage(pattern=r'^\.gf$', outgoing=True))
 async def cmd_gs_off(event):
@@ -829,12 +841,10 @@ async def cmd_gs_off(event):
     if event.sender_id != OWNER_ID:
         return
     global gs_enabled
-    if not gs_enabled:
-        await event.reply("Транскрибация уже выключена")
-        return
     gs_enabled = False
     await save_kick_state()
-    await event.reply("Транскрибация голосовых выключена")
+    resp = await event.reply("успешно")
+    _cleanup5(event, resp)
 
 
 #
@@ -1076,7 +1086,8 @@ async def cmd_richtext_on(event):
     global richtext_enabled
     richtext_enabled = True
     await save_kick_state()
-    await event.reply("успешно")
+    resp = await event.reply("успешно")
+    _cleanup5(event, resp)
 
 
 @client.on(events.NewMessage(pattern=r'^\.off$', outgoing=True))
@@ -1086,7 +1097,8 @@ async def cmd_richtext_off(event):
     global richtext_enabled
     richtext_enabled = False
     await save_kick_state()
-    await event.reply("успешно")
+    resp = await event.reply("успешно")
+    _cleanup5(event, resp)
 
 
 # .sh1 — обычный (без обёртки). .sh2-.sh14 — оборачивают текст в
@@ -1121,7 +1133,8 @@ def _make_style_handler(tag):
         global _rich_style_tag
         _rich_style_tag = tag
         await save_kick_state()
-        await event.reply("успешно")
+        resp = await event.reply("успешно")
+        _cleanup5(event, resp)
     return handler
 
 
@@ -1295,12 +1308,10 @@ async def cmd_autoban_on(event):
     if event.sender_id != OWNER_ID:
         return
     global ban_enabled
-    if ban_enabled:
-        await event.reply("Автобан номеров уже включен")
-        return
     ban_enabled = True
     await save_kick_state()
-    await event.reply("Автобан номеров включен")
+    resp = await event.reply("успешно")
+    _cleanup5(event, resp)
 
 
 @client.on(events.NewMessage(pattern=r'^\.banf$', outgoing=True))
@@ -1309,12 +1320,10 @@ async def cmd_autoban_off(event):
     if event.sender_id != OWNER_ID:
         return
     global ban_enabled
-    if not ban_enabled:
-        await event.reply("Автобан номеров уже выключен")
-        return
     ban_enabled = False
     await save_kick_state()
-    await event.reply("Автобан номеров выключен")
+    resp = await event.reply("успешно")
+    _cleanup5(event, resp)
 
 
 @client.on(events.NewMessage(incoming=True))
@@ -1548,7 +1557,7 @@ async def handler_avtodel(event):
     if worker is None or worker.done():
         auto_delete_worker_map[chat_id] = client.loop.create_task(_autodelete_worker(chat_id))
     resp = await event.respond(f"Автоудаление: {val}{unit}")
-    client.loop.create_task(_delete_after(resp, 30))
+    _cleanup5(event, resp)
 
 @client.on(events.NewMessage(outgoing=True, pattern=r'^\.avtoff$'))
 async def handler_avtoff(event):
@@ -1577,7 +1586,7 @@ async def handler_avtoff(event):
             pass
         auto_delete_queue_map[chat_id] = None
     resp = await event.respond("Автоудаление выключено")
-    client.loop.create_task(_delete_after(resp, 30))
+    _cleanup5(event, resp)
 
 @client.on(events.NewMessage(outgoing=True))
 async def _collect_for_autodelete(event):
@@ -1638,16 +1647,16 @@ async def handler_delall(event):
                     pass
             final_text, final_entities = _custom_emoji_suffix(DELALL_EMOJI_ID, f"Удалено {len(ids)} сообщений")
             final = await client.send_message(event.chat_id, final_text, formatting_entities=final_entities)
-            asyncio.create_task(_delete_later([temp, final], 30))
+            _cleanup5(event, temp, final)
             gc.collect()
         else:
             final_text, final_entities = _custom_emoji_suffix(DELALL_EMOJI_ID, "Нет сообщений")
             final = await client.send_message(event.chat_id, final_text, formatting_entities=final_entities)
-            asyncio.create_task(_delete_later([temp, final], 30))
+            _cleanup5(event, temp, final)
     except Exception:
         blank_text, blank_entities = _custom_emoji_suffix(DELALL_EMOJI_ID, "Ошибка")
         blank = await client.send_message(event.chat_id, blank_text, formatting_entities=blank_entities)
-        asyncio.create_task(_delete_later([temp, blank], 30))
+        _cleanup5(event, temp, blank)
 
 @client.on(events.NewMessage(outgoing=True, pattern=r'^\.del (\d+)$'))
 async def handler_del_count(event):
@@ -1661,10 +1670,10 @@ async def handler_del_count(event):
         if ids:
             await client.delete_messages(event.chat_id, ids)
             resp = await event.respond(f"Удалено {len(ids)} сообщений")
-            asyncio.create_task(_delete_later([resp], 30))
+            _cleanup5(event, resp)
         else:
             resp = await event.respond("Нет сообщений для удаления")
-            asyncio.create_task(_delete_later([resp], 30))
+            _cleanup5(event, resp)
     except Exception:
         pass
 
@@ -1869,7 +1878,7 @@ async def remove_channel(event):
                 lines.append(f'{idx}. {title}')
             lines += ['', 'Убрать: .remove <номер>']
             await event.edit('\n'.join(lines))
-            await asyncio.sleep(20)
+            await asyncio.sleep(5)
             await event.delete()
             return
         # 0 совпадений по названию — пробуем как ID/@username ниже
@@ -2507,9 +2516,9 @@ async def cmd_help(event):
         " .help             эта справка\n"
     )
     resp = await event.respond(text)
-    asyncio.create_task(_delete_after(resp, 60))
+    _cleanup5(event, resp)
 
-# 
+#
 # ГЛАВНАЯ ФУНКЦИЯ И ЗАПУСК
 # 
 
