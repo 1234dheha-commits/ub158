@@ -233,6 +233,16 @@ gs_enabled = False
 baseline_hashes = set()
 monitor_task = None
 
+# Рич-текст через @Text2RichBot (.on/.off)
+richtext_enabled = False
+RICHBOT_USERNAME = os.getenv('RICHBOT_USERNAME', 'Text2RichBot').lstrip('@')
+_richbot_entity_cache = None
+_rich_lock = asyncio.Lock()
+# Обход перехвата для исходящих, которые шлёт сам код (запрос к боту,
+# автокомменты и т.п.) — иначе сообщение само себе зациклится на конвертацию.
+_rich_bypass = False
+_rich_skip_ids = set()
+
 MAX_BANNED_CACHE = 1000
 banned_cache = set()
 
@@ -551,26 +561,33 @@ def clean(t):
 # 
 
 async def load_kick_state():
-    """Загружает состояние автокика."""
-    global kick_enabled, baseline_hashes, gs_enabled
+    """Загружает состояние автокика / гс / рич-текста."""
+    global kick_enabled, baseline_hashes, gs_enabled, richtext_enabled
     if os.path.exists(state_file):
         try:
             with open(state_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 kick_enabled = bool(data.get("kick_enabled", False))
                 gs_enabled = bool(data.get("gs_enabled", False))
+                richtext_enabled = bool(data.get("richtext_enabled", False))
                 baseline_hashes = set(data.get("baseline_hashes", []))
         except Exception:
             kick_enabled = False
             gs_enabled = False
+            richtext_enabled = False
             baseline_hashes = set()
 
 async def save_kick_state():
-    """Сохраняет состояние автокика."""
-    global kick_enabled, baseline_hashes, gs_enabled
+    """Сохраняет состояние автокика / гс / рич-текста."""
+    global kick_enabled, baseline_hashes, gs_enabled, richtext_enabled
     try:
         with open(state_file, "w", encoding="utf-8") as f:
-            json.dump({"kick_enabled": bool(kick_enabled), "gs_enabled": bool(gs_enabled), "baseline_hashes": list(baseline_hashes)}, f)
+            json.dump({
+                "kick_enabled": bool(kick_enabled),
+                "gs_enabled": bool(gs_enabled),
+                "richtext_enabled": bool(richtext_enabled),
+                "baseline_hashes": list(baseline_hashes),
+            }, f)
     except Exception:
         pass
 
@@ -696,6 +713,124 @@ async def cmd_gs_off(event):
     gs_enabled = False
     await save_kick_state()
     await event.reply("Транскрибация голосовых выключена")
+
+
+#
+# РИЧ-ТЕКСТ ЧЕРЕЗ @Text2RichBot
+# .on  — включает: каждое твоё обычное сообщение уходит боту в личку,
+#        ответ бота (с его форматированием) подставляется на место
+#        твоего исходного сообщения через edit.
+# .off — выключает.
+# Не трогаем: команды (.xxx), автокомментарии, уже отформатированные
+# сообщения и переписку с самим ботом (чтобы не зациклиться).
+#
+
+async def _get_richbot_entity():
+    """Резолвит и кэширует entity @Text2RichBot."""
+    global _richbot_entity_cache
+    if _richbot_entity_cache is None:
+        _richbot_entity_cache = await client.get_entity(RICHBOT_USERNAME)
+    return _richbot_entity_cache
+
+
+async def _convert_via_richbot(text: str):
+    """Отправляет текст боту и возвращает (текст, entities) его ответа.
+
+    Захватывает _rich_lock, т.к. диалог с ботом идёт в одном чате — если не
+    сериализовать запросы, параллельные конвертации перепутают ответы между
+    собой.
+    """
+    global _rich_bypass, _rich_skip_ids
+    bot_entity = await _get_richbot_entity()
+    async with _rich_lock:
+        _rich_bypass = True
+        try:
+            async with client.conversation(bot_entity, timeout=20, total_timeout=25) as conv:
+                sent = await conv.send_message(text)
+                if sent is not None and getattr(sent, 'id', None):
+                    _rich_skip_ids.add(sent.id)
+                resp = await conv.get_response()
+        finally:
+            _rich_bypass = False
+    result_text = resp.raw_text if resp.raw_text else resp.message
+    if not result_text or not result_text.strip():
+        return None, None
+    return result_text, resp.entities
+
+
+@client.on(events.NewMessage(pattern=r'^\.on$', outgoing=True))
+async def cmd_richtext_on(event):
+    """Включает авто-конвертацию исходящих через @Text2RichBot."""
+    if event.sender_id != OWNER_ID:
+        return
+    global richtext_enabled
+    if richtext_enabled:
+        await event.reply("Рич-текст уже включён")
+        return
+    richtext_enabled = True
+    await save_kick_state()
+    await event.reply("Рич-текст включён — сообщения будут проходить через @Text2RichBot")
+
+
+@client.on(events.NewMessage(pattern=r'^\.off$', outgoing=True))
+async def cmd_richtext_off(event):
+    """Выключает авто-конвертацию исходящих через @Text2RichBot."""
+    if event.sender_id != OWNER_ID:
+        return
+    global richtext_enabled
+    if not richtext_enabled:
+        await event.reply("Рич-текст уже выключен")
+        return
+    richtext_enabled = False
+    await save_kick_state()
+    await event.reply("Рич-текст выключен")
+
+
+@client.on(events.NewMessage(outgoing=True))
+async def handle_richtext(event):
+    """Переоформляет исходящий текст через @Text2RichBot, если фича включена."""
+    global _rich_skip_ids
+    if event.sender_id != OWNER_ID:
+        return
+    if event.id in _rich_skip_ids:
+        _rich_skip_ids.discard(event.id)
+        return
+    if not richtext_enabled or _rich_bypass:
+        return
+    text = getattr(event.message, 'message', None) or ''
+    if not text or not text.strip():
+        return
+    if text.strip().startswith('.'):
+        return
+    # Уже есть разметка (в т.ч. рич-шрифт) — не трогаем повторно
+    if getattr(event.message, 'entities', None):
+        return
+    # Автокомментарии под постами не конвертируем
+    if text.strip() in COMMENTS:
+        return
+    try:
+        bot_entity = await _get_richbot_entity()
+    except Exception:
+        return
+    if bot_entity is None:
+        return
+    # Переписку с самим ботом форматирования не трогаем (иначе цикл)
+    try:
+        if event.chat_id == utils.get_peer_id(bot_entity):
+            return
+    except Exception:
+        pass
+    try:
+        result_text, result_entities = await _convert_via_richbot(text)
+    except Exception:
+        return
+    if not result_text:
+        return
+    try:
+        await event.message.edit(result_text, formatting_entities=result_entities)
+    except Exception:
+        pass
+
 
 def _transcribe_sync(voice_bytes: bytes) -> str | None:
     """Синхронная транскрибация через faster-whisper (запускается в executor)."""
@@ -1608,11 +1743,16 @@ async def auto_comment(event):
 
         for attempt in range(2):
             try:
-                await client.send_message(
-                    entity=event.chat_id,
-                    message=comment,
-                    comment_to=event.id
-                )
+                global _rich_bypass
+                _rich_bypass = True
+                try:
+                    await client.send_message(
+                        entity=event.chat_id,
+                        message=comment,
+                        comment_to=event.id
+                    )
+                finally:
+                    _rich_bypass = False
                 _record_comment(event.chat_id)
                 return
             except errors.FloodWaitError as e:
@@ -1801,6 +1941,10 @@ async def cmd_help(event):
         "ТРАНСКРИБАЦИЯ ГОЛОСОВЫХ:\n"
         "  .gn                включить (авто для всех гс)\n"
         "  .gf                выключить\n\n"
+        "РИЧ-ТЕКСТ (через @Text2RichBot):\n"
+        "  .on                включить авто-конвертацию твоих сообщений\n"
+        "  .off               выключить\n"
+        "  (команды и автокомменты не трогает)\n\n"
         "  .kick              включить автокик\n"
         "  .kickf             выключить\n\n"
         " .help             эта справка\n"
@@ -1828,7 +1972,8 @@ async def main():
     # Загрузка состояния автокика
     await load_kick_state()
     print(f' Состояние автокика: {"ВКЛ" if kick_enabled else "ВЫКЛ"}')
-    
+    print(f' Рич-текст: {"ВКЛ" if richtext_enabled else "ВЫКЛ"}')
+
     # Запуск фоновой задачи автоочистки
     autoclean_task = asyncio.create_task(autoclean_loop())
     print('Автоочистка адеюирована (раз в 3 дня)')
