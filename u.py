@@ -18,7 +18,12 @@ from telethon import TelegramClient, events, functions, errors, utils
 from telethon.sessions import StringSession
 from telethon.tl.functions.channels import EditBannedRequest, GetFullChannelRequest, JoinChannelRequest, LeaveChannelRequest
 from telethon.tl.functions.messages import DeleteChatUserRequest
-from telethon.tl.types import ChatBannedRights, MessageEntityCustomEmoji, PeerChannel, PeerChat
+from telethon.tl.functions.folders import EditPeerFoldersRequest
+from telethon.tl.functions.account import UpdateNotifySettingsRequest
+from telethon.tl.types import (
+    ChatBannedRights, MessageEntityCustomEmoji, PeerChannel, PeerChat,
+    InputFolderPeer, InputNotifyPeer, InputPeerNotifySettings,
+)
 import psycopg2
 from concurrent.futures import ThreadPoolExecutor
 
@@ -233,15 +238,19 @@ gs_enabled = False
 baseline_hashes = set()
 monitor_task = None
 
-# Рич-текст через @Text2RichBot (.on/.off)
+# Рич-текст через @Text2RichBot (.on/.off, .sh1/.sh2)
 richtext_enabled = False
 RICHBOT_USERNAME = os.getenv('RICHBOT_USERNAME', 'Text2RichBot').lstrip('@')
 _richbot_entity_cache = None
+_richbot_prepared = False  # архивация+мут чата с ботом сделаны один раз
 _rich_lock = asyncio.Lock()
 # Обход перехвата для исходящих, которые шлёт сам код (запрос к боту,
 # автокомменты и т.п.) — иначе сообщение само себе зациклится на конвертацию.
 _rich_bypass = False
 _rich_skip_ids = set()
+# Тег стиля, которым оборачивается текст перед отправкой боту:
+# None -> обычный (.sh1), 'h3' -> <h3>текст</h3> (.sh2)
+_rich_style_tag = None
 
 MAX_BANNED_CACHE = 1000
 banned_cache = set()
@@ -562,7 +571,7 @@ def clean(t):
 
 async def load_kick_state():
     """Загружает состояние автокика / гс / рич-текста."""
-    global kick_enabled, baseline_hashes, gs_enabled, richtext_enabled
+    global kick_enabled, baseline_hashes, gs_enabled, richtext_enabled, _rich_style_tag
     if os.path.exists(state_file):
         try:
             with open(state_file, "r", encoding="utf-8") as f:
@@ -570,22 +579,25 @@ async def load_kick_state():
                 kick_enabled = bool(data.get("kick_enabled", False))
                 gs_enabled = bool(data.get("gs_enabled", False))
                 richtext_enabled = bool(data.get("richtext_enabled", False))
+                _rich_style_tag = data.get("rich_style_tag") or None
                 baseline_hashes = set(data.get("baseline_hashes", []))
         except Exception:
             kick_enabled = False
             gs_enabled = False
             richtext_enabled = False
+            _rich_style_tag = None
             baseline_hashes = set()
 
 async def save_kick_state():
     """Сохраняет состояние автокика / гс / рич-текста."""
-    global kick_enabled, baseline_hashes, gs_enabled, richtext_enabled
+    global kick_enabled, baseline_hashes, gs_enabled, richtext_enabled, _rich_style_tag
     try:
         with open(state_file, "w", encoding="utf-8") as f:
             json.dump({
                 "kick_enabled": bool(kick_enabled),
                 "gs_enabled": bool(gs_enabled),
                 "richtext_enabled": bool(richtext_enabled),
+                "rich_style_tag": _rich_style_tag,
                 "baseline_hashes": list(baseline_hashes),
             }, f)
     except Exception:
@@ -717,19 +729,45 @@ async def cmd_gs_off(event):
 
 #
 # РИЧ-ТЕКСТ ЧЕРЕЗ @Text2RichBot
-# .on  — включает: каждое твоё обычное сообщение уходит боту в личку,
-#        ответ бота (с его форматированием) подставляется на место
-#        твоего исходного сообщения через edit.
+# .on  — включает: каждое твоё обычное сообщение (текст или подпись под
+#        фото/видео) уходит боту в личку, ответ бота (с его форматированием)
+#        подставляется на место твоего исходного сообщения через edit.
 # .off — выключает.
+# .sh1 — обычный стиль (текст шлётся боту как есть).
+# .sh2 — стиль h3 (текст перед отправкой боту оборачивается в <h3>...</h3> —
+#        это собственный синтаксис самого бота для выбора шрифта, а не
+#        HTML-разметка Telegram).
 # Не трогаем: команды (.xxx), автокомментарии, уже отформатированные
-# сообщения и переписку с самим ботом (чтобы не зациклиться).
+# сообщения и переписку с самим ботом (чтобы не зациклиться). Чат с ботом
+# при первом обращении архивируется и заглушается, чтобы не мозолил глаза.
 #
+
+async def _prepare_richbot_dialog(bot_entity):
+    """Архивирует и заглушает чат с ботом (один раз)."""
+    global _richbot_prepared
+    if _richbot_prepared:
+        return
+    _richbot_prepared = True
+    try:
+        input_peer = await client.get_input_entity(bot_entity)
+        await client(EditPeerFoldersRequest(
+            folder_peers=[InputFolderPeer(peer=input_peer, folder_id=1)]
+        ))
+        await client(UpdateNotifySettingsRequest(
+            peer=InputNotifyPeer(peer=input_peer),
+            settings=InputPeerNotifySettings(mute_until=2 ** 31 - 1)
+        ))
+    except Exception:
+        pass
+
 
 async def _get_richbot_entity():
     """Резолвит и кэширует entity @Text2RichBot."""
     global _richbot_entity_cache
     if _richbot_entity_cache is None:
-        _richbot_entity_cache = await client.get_entity(RICHBOT_USERNAME)
+        entity = await client.get_entity(RICHBOT_USERNAME)
+        await _prepare_richbot_dialog(entity)
+        _richbot_entity_cache = entity
     return _richbot_entity_cache
 
 
@@ -742,11 +780,14 @@ async def _convert_via_richbot(text: str):
     """
     global _rich_bypass, _rich_skip_ids
     bot_entity = await _get_richbot_entity()
+    payload = f'<{_rich_style_tag}>{text}</{_rich_style_tag}>' if _rich_style_tag else text
     async with _rich_lock:
         _rich_bypass = True
         try:
             async with client.conversation(bot_entity, timeout=20, total_timeout=25) as conv:
-                sent = await conv.send_message(text)
+                # parse_mode=None — шлём как есть, без интерпретации markdown/html,
+                # иначе теги <h3> или спецсимволы markdown исказят то, что видит бот.
+                sent = await conv.send_message(payload, parse_mode=None)
                 if sent is not None and getattr(sent, 'id', None):
                     _rich_skip_ids.add(sent.id)
                 resp = await conv.get_response()
@@ -786,9 +827,31 @@ async def cmd_richtext_off(event):
     await event.reply("Рич-текст выключен")
 
 
+@client.on(events.NewMessage(pattern=r'^\.sh1$', outgoing=True))
+async def cmd_richtext_style_plain(event):
+    """Обычный стиль — текст шлётся боту без обёртки."""
+    if event.sender_id != OWNER_ID:
+        return
+    global _rich_style_tag
+    _rich_style_tag = None
+    await save_kick_state()
+    await event.reply("Шрифт: обычный")
+
+
+@client.on(events.NewMessage(pattern=r'^\.sh2$', outgoing=True))
+async def cmd_richtext_style_h3(event):
+    """Стиль h3 — текст оборачивается в <h3>...</h3> перед отправкой боту."""
+    if event.sender_id != OWNER_ID:
+        return
+    global _rich_style_tag
+    _rich_style_tag = 'h3'
+    await save_kick_state()
+    await event.reply("Шрифт: h3")
+
+
 @client.on(events.NewMessage(outgoing=True))
 async def handle_richtext(event):
-    """Переоформляет исходящий текст через @Text2RichBot, если фича включена."""
+    """Переоформляет исходящий текст/подпись через @Text2RichBot, если фича включена."""
     global _rich_skip_ids
     if event.sender_id != OWNER_ID:
         return
@@ -797,6 +860,8 @@ async def handle_richtext(event):
         return
     if not richtext_enabled or _rich_bypass:
         return
+    # event.message.message — это и обычный текст, и подпись под фото/видео,
+    # поэтому подписи под медиа обрабатываются тем же путём без спецкода.
     text = getattr(event.message, 'message', None) or ''
     if not text or not text.strip():
         return
@@ -1944,7 +2009,10 @@ async def cmd_help(event):
         "РИЧ-ТЕКСТ (через @Text2RichBot):\n"
         "  .on                включить авто-конвертацию твоих сообщений\n"
         "  .off               выключить\n"
-        "  (команды и автокомменты не трогает)\n\n"
+        "  .sh1               обычный шрифт\n"
+        "  .sh2               шрифт h3\n"
+        "  (команды, автокомменты и уже отформатированное не трогает;\n"
+        "   подписи под фото/видео конвертируются тоже)\n\n"
         "  .kick              включить автокик\n"
         "  .kickf             выключить\n\n"
         " .help             эта справка\n"
