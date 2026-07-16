@@ -930,7 +930,10 @@ def _richtext_to_html(rt) -> str:
         return ''
     cls = type(rt).__name__
     if cls == 'TextPlain':
-        return html.escape(rt.text or '')
+        # \n внутри текстового узла — это реальный перенос строки, но при
+        # рендере в HTML его нужно явно превратить в <br>, иначе он
+        # схлопнется в пробел при парсинге HTML на другой стороне.
+        return html.escape(rt.text or '').replace('\n', '<br>')
     if cls == 'TextConcat':
         return ''.join(_richtext_to_html(t) for t in (rt.texts or []))
     if cls in _RICHTEXT_TAG_HTML:
@@ -1037,6 +1040,18 @@ async def _ask_richbot(bot_entity, payload: str):
     return result_text, resp.entities, None
 
 
+def _prepare_bot_payload(text: str) -> str:
+    """Готовит текст к отправке боту как HTML-источник rich-message.
+
+    Бот парсит наш ввод как HTML (это видно по тому, что даже без тега
+    стиля ответ приходит обёрнутым в <p>...</p>) — поэтому спецсимволы
+    нужно экранировать, а переносы строк явно превратить в <br>, иначе
+    HTML-парсер схлопнет их в пробел и многострочное сообщение станет
+    однострочным.
+    """
+    return html.escape(text).replace('\n', '<br>')
+
+
 async def _convert_via_richbot(text: str):
     """Отправляет текст боту (с учётом стиля .sh1/.sh2) и возвращает ответ.
 
@@ -1045,11 +1060,12 @@ async def _convert_via_richbot(text: str):
     обычным текстом без обёртки, чтобы .sh2 не превращался в тишину.
     """
     bot_entity = await _get_richbot_entity()
-    payload = f'<{_rich_style_tag}>{text}</{_rich_style_tag}>' if _rich_style_tag else text
+    safe_text = _prepare_bot_payload(text)
+    payload = f'<{_rich_style_tag}>{safe_text}</{_rich_style_tag}>' if _rich_style_tag else safe_text
     result_text, result_entities, rich_html = await _ask_richbot(bot_entity, payload)
     if not result_text and _rich_style_tag:
         print(f'[richtext] пустой ответ на <{_rich_style_tag}>, повторяю без обёртки')
-        result_text, result_entities, rich_html = await _ask_richbot(bot_entity, text)
+        result_text, result_entities, rich_html = await _ask_richbot(bot_entity, safe_text)
     return result_text, result_entities, rich_html
 
 
