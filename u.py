@@ -1071,30 +1071,22 @@ async def _convert_via_richbot(text: str):
 
 @client.on(events.NewMessage(pattern=r'^\.on$', outgoing=True))
 async def cmd_richtext_on(event):
-    """Включает авто-конвертацию исходящих через @Text2RichBot."""
     if event.sender_id != OWNER_ID:
         return
     global richtext_enabled
-    if richtext_enabled:
-        await event.reply("Рич-текст уже включён")
-        return
     richtext_enabled = True
     await save_kick_state()
-    await event.reply("Рич-текст включён — сообщения будут проходить через @Text2RichBot")
+    await event.reply("успешно")
 
 
 @client.on(events.NewMessage(pattern=r'^\.off$', outgoing=True))
 async def cmd_richtext_off(event):
-    """Выключает авто-конвертацию исходящих через @Text2RichBot."""
     if event.sender_id != OWNER_ID:
         return
     global richtext_enabled
-    if not richtext_enabled:
-        await event.reply("Рич-текст уже выключен")
-        return
     richtext_enabled = False
     await save_kick_state()
-    await event.reply("Рич-текст выключен")
+    await event.reply("успешно")
 
 
 # .sh1 — обычный (без обёртки). .sh2-.sh14 — оборачивают текст в
@@ -1129,7 +1121,7 @@ def _make_style_handler(tag):
         global _rich_style_tag
         _rich_style_tag = tag
         await save_kick_state()
-        await event.reply(f"Шрифт: {tag or 'обычный'}")
+        await event.reply("успешно")
     return handler
 
 
