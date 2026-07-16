@@ -253,39 +253,6 @@ _rich_skip_ids = set()
 _rich_style_tag = None
 _rich_last_error_ts = 0
 
-# Автобан новых номеров не из гео Украины/России + анонимных номеров (.ban/.banf)
-# По умолчанию включен.
-ban_enabled = True
-# Разрешённые телефонные префиксы (без "+"): Украина, Россия (код 7 общий с Казахстаном)
-ALLOWED_PHONE_PREFIXES = ('380', '7')
-
-# Телефонные коды стран (для отчёта в .ban — "что за номер"). Не исчерпывающе,
-# но покрывает основные страны; неизвестные коды репортятся как есть.
-PHONE_COUNTRY_CODES = {
-    '380': 'Украина', '375': 'Беларусь', '374': 'Армения', '373': 'Молдова',
-    '372': 'Эстония', '371': 'Латвия', '370': 'Литва', '994': 'Азербайджан',
-    '995': 'Грузия', '996': 'Киргизия', '998': 'Узбекистан', '992': 'Таджикистан',
-    '993': 'Туркменистан', '7': 'Россия/Казахстан',
-    '1': 'США/Канада', '44': 'Великобритания', '49': 'Германия', '33': 'Франция',
-    '34': 'Испания', '39': 'Италия', '31': 'Нидерланды', '32': 'Бельгия',
-    '41': 'Швейцария', '43': 'Австрия', '48': 'Польша', '420': 'Чехия',
-    '421': 'Словакия', '36': 'Венгрия', '40': 'Румыния', '359': 'Болгария',
-    '385': 'Хорватия', '386': 'Словения', '381': 'Сербия', '30': 'Греция',
-    '351': 'Португалия', '352': 'Люксембург', '353': 'Ирландия', '354': 'Исландия',
-    '358': 'Финляндия', '45': 'Дания', '46': 'Швеция', '47': 'Норвегия',
-    '90': 'Турция', '20': 'Египет', '212': 'Марокко', '213': 'Алжир',
-    '216': 'Тунис', '234': 'Нигерия', '233': 'Гана', '254': 'Кения',
-    '27': 'ЮАР', '251': 'Эфиопия', '256': 'Уганда', '255': 'Танзания',
-    '86': 'Китай', '81': 'Япония', '82': 'Южная Корея', '91': 'Индия',
-    '92': 'Пакистан', '880': 'Бангладеш', '84': 'Вьетнам', '66': 'Таиланд',
-    '63': 'Филиппины', '62': 'Индонезия', '60': 'Малайзия', '65': 'Сингапур',
-    '972': 'Израиль', '971': 'ОАЭ', '966': 'Саудовская Аравия', '974': 'Катар',
-    '965': 'Кувейт', '962': 'Иордания', '961': 'Ливан', '964': 'Ирак',
-    '98': 'Иран', '93': 'Афганистан', '52': 'Мексика', '55': 'Бразилия',
-    '54': 'Аргентина', '56': 'Чили', '57': 'Колумбия', '58': 'Венесуэла',
-    '51': 'Перу', '61': 'Австралия', '64': 'Новая Зеландия',
-}
-
 MAX_BANNED_CACHE = 1000
 banned_cache = set()
 
@@ -683,7 +650,7 @@ async def load_kick_state():
     контейнера эфемерный); локальный файл — запасной вариант для дев-режима
     без Postgres (DATABASE_URL не задан).
     """
-    global kick_enabled, baseline_hashes, gs_enabled, richtext_enabled, _rich_style_tag, ban_enabled
+    global kick_enabled, baseline_hashes, gs_enabled, richtext_enabled, _rich_style_tag
     data = {}
     try:
         if DATABASE_URL:
@@ -697,25 +664,22 @@ async def load_kick_state():
         gs_enabled = bool(data.get("gs_enabled", False))
         richtext_enabled = bool(data.get("richtext_enabled", False))
         _rich_style_tag = data.get("rich_style_tag") or None
-        ban_enabled = bool(data.get("ban_enabled", True))
         baseline_hashes = set(data.get("baseline_hashes", []))
     except Exception:
         kick_enabled = False
         gs_enabled = False
         richtext_enabled = False
         _rich_style_tag = None
-        ban_enabled = True
         baseline_hashes = set()
 
 async def save_kick_state():
-    """Сохраняет состояние автокика / гс / рич-текста / автобана (БД, иначе локальный файл)."""
-    global kick_enabled, baseline_hashes, gs_enabled, richtext_enabled, _rich_style_tag, ban_enabled
+    """Сохраняет состояние автокика / гс / рич-текста (БД, иначе локальный файл)."""
+    global kick_enabled, baseline_hashes, gs_enabled, richtext_enabled, _rich_style_tag
     payload = {
         "kick_enabled": bool(kick_enabled),
         "gs_enabled": bool(gs_enabled),
         "richtext_enabled": bool(richtext_enabled),
         "rich_style_tag": _rich_style_tag,
-        "ban_enabled": bool(ban_enabled),
         "baseline_hashes": list(baseline_hashes),
     }
     try:
@@ -1269,113 +1233,6 @@ async def handle_richtext_edited(event):
     if not getattr(event.message, 'media', None):
         return
     await _process_richtext(event)
-
-
-#
-# АВТОБАН НОВЫХ НОМЕРОВ НЕ ИЗ UA/RU
-# .ban  — включает (по умолчанию уже включено).
-# .banf — выключает.
-# Срабатывает только на ПЕРВОЕ сообщение от нового собеседника в личке:
-# если номер телефона не виден (скрыт приватностью — считаем «анонимным»)
-# или не начинается с +380/+7 — юзербот блокирует и удаляет переписку,
-# отчёт (кто и что написал) уходит в Избранное и не удаляется. Если
-# собеседник уже писал раньше — не трогаем вообще, независимо от номера.
-#
-
-def _phone_is_allowed(phone) -> bool:
-    """True, если номер виден и относится к разрешённому гео (UA/RU)."""
-    phone = (phone or '').lstrip('+')
-    if not phone:
-        return False
-    return any(phone.startswith(p) for p in ALLOWED_PHONE_PREFIXES)
-
-
-def _phone_country_name(phone) -> str:
-    """Определяет страну по коду номера (для отчёта), самый длинный код — приоритет."""
-    phone = (phone or '').lstrip('+')
-    if not phone:
-        return 'скрыт/анонимный'
-    for length in (3, 2, 1):
-        code = phone[:length]
-        if code in PHONE_COUNTRY_CODES:
-            return f'{PHONE_COUNTRY_CODES[code]} (+{code})'
-    return f'неизвестная страна (+{phone[:3]})'
-
-
-@client.on(events.NewMessage(pattern=r'^\.ban$', outgoing=True))
-async def cmd_autoban_on(event):
-    """Включает автобан новых номеров не из UA/RU."""
-    if event.sender_id != OWNER_ID:
-        return
-    global ban_enabled
-    ban_enabled = True
-    await save_kick_state()
-    resp = await event.reply("успешно")
-    _cleanup5(event, resp)
-
-
-@client.on(events.NewMessage(pattern=r'^\.banf$', outgoing=True))
-async def cmd_autoban_off(event):
-    """Выключает автобан новых номеров не из UA/RU."""
-    if event.sender_id != OWNER_ID:
-        return
-    global ban_enabled
-    ban_enabled = False
-    await save_kick_state()
-    resp = await event.reply("успешно")
-    _cleanup5(event, resp)
-
-
-@client.on(events.NewMessage(incoming=True))
-async def handle_autoban_numbers(event):
-    """Банит новых собеседников в личке с номером не из UA/RU (или скрытым)."""
-    if not ban_enabled:
-        return
-    if not event.is_private:
-        return
-    try:
-        sender = await event.get_sender()
-    except Exception:
-        return
-    if sender is None or getattr(sender, 'bot', False) or getattr(sender, 'is_self', False):
-        return
-    # Уже переписывались раньше (в любую сторону) — не трогаем
-    try:
-        prior = await client.get_messages(event.chat_id, limit=1, offset_id=event.id)
-    except Exception:
-        return
-    if prior:
-        return
-    phone = getattr(sender, 'phone', None)
-    if _phone_is_allowed(phone):
-        return
-    name = utils.get_display_name(sender)
-    username = f'@{sender.username}' if getattr(sender, 'username', None) else '—'
-    phone_line = f'{phone} — {_phone_country_name(phone)}' if phone else _phone_country_name(phone)
-    report = (
-        f'Автобан по номеру\n'
-        f'Кто: {name} ({username}, id {sender.id})\n'
-        f'Номер: {phone_line}\n'
-        f'Написал: {event.raw_text or "[медиа/без текста]"}'
-    )
-    try:
-        await client(functions.contacts.BlockRequest(id=sender))
-    except Exception as e:
-        print(f'[autoban] block error: {e}')
-    try:
-        await client(functions.messages.DeleteHistoryRequest(peer=sender, max_id=0, revoke=True))
-    except Exception as e:
-        print(f'[autoban] delete history error: {e}')
-    global _rich_bypass, _rich_skip_ids
-    _rich_bypass = True
-    try:
-        sent = await client.send_message(OWNER_ID, report)
-        if sent is not None and getattr(sent, 'id', None):
-            _rich_skip_ids.add(sent.id)
-    except Exception as e:
-        print(f'[autoban] report error: {e}')
-    finally:
-        _rich_bypass = False
 
 
 def _transcribe_sync(voice_bytes: bytes) -> str | None:
@@ -2508,9 +2365,6 @@ async def cmd_help(event):
         "  .sh14              код        (code)\n"
         "  (команды, автокомменты и уже отформатированное не трогает;\n"
         "   подписи под фото/видео конвертируются тоже)\n\n"
-        "АВТОБАН НОМЕРОВ (не UA/RU + анонимные, только новые диалоги):\n"
-        "  .ban               включить (по умолчанию уже включено)\n"
-        "  .banf              выключить\n\n"
         "  .kick              включить автокик\n"
         "  .kickf             выключить\n\n"
         " .help             эта справка\n"
@@ -2539,7 +2393,6 @@ async def main():
     await load_kick_state()
     print(f' Состояние автокика: {"ВКЛ" if kick_enabled else "ВЫКЛ"}')
     print(f' Рич-текст: {"ВКЛ" if richtext_enabled else "ВЫКЛ"}')
-    print(f' Автобан номеров: {"ВКЛ" if ban_enabled else "ВЫКЛ"}')
 
     # Запуск фоновой задачи автоочистки
     autoclean_task = asyncio.create_task(autoclean_loop())
