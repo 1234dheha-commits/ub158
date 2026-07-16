@@ -1140,10 +1140,16 @@ for _sh_cmd, _sh_tag in RICH_STYLE_TAGS.items():
     )
 
 
-@client.on(events.NewMessage(outgoing=True))
-async def handle_richtext(event):
-    """Переоформляет исходящий текст/подпись через @Text2RichBot, если фича включена."""
-    global _rich_skip_ids
+async def _process_richtext(event):
+    """Переоформляет исходящий текст/подпись через @Text2RichBot, если фича включена.
+
+    Общая логика для events.NewMessage (обычная отправка) и
+    events.MessageEdited (некоторые клиенты Telegram при медленной
+    загрузке сперва шлют фото БЕЗ подписи, а саму подпись добавляют
+    следующим edit-ом — без этого подписи под такими фото никогда не
+    доходили бы до конвертации).
+    """
+    global _rich_skip_ids, _rich_bypass
     if event.sender_id != OWNER_ID:
         return
     if event.id in _rich_skip_ids:
@@ -1191,6 +1197,9 @@ async def handle_richtext(event):
         return
     print(f'[richtext] ответ бота: {result_text[:60]!r} entities={len(result_entities or [])} rich_html={bool(rich_html)}')
     protected_chat = bool(getattr(event.message, 'noforwards', False))
+    # Наша собственная правка тоже порождает событие MessageEdited — без
+    # этого флага она бы зациклилась сама на себя через тот же обработчик.
+    _rich_bypass = True
     try:
         if rich_html:
             # Telethon's edit()/edit_message() не пробрасывают rich_message —
@@ -1246,6 +1255,24 @@ async def handle_richtext(event):
         except Exception as e2:
             print(f'[richtext] fallback edit тоже упал: {e2!r}')
             await _debug_notify('edit сообщения', e2)
+    finally:
+        _rich_bypass = False
+
+
+@client.on(events.NewMessage(outgoing=True))
+async def handle_richtext_new(event):
+    await _process_richtext(event)
+
+
+@client.on(events.MessageEdited(outgoing=True))
+async def handle_richtext_edited(event):
+    # Только подписи под медиа: некоторые клиенты Telegram на медленной
+    # загрузке шлют фото/видео сразу, а подпись добавляют следующим edit-ом.
+    # Обычные текстовые правки (статусы .scan/.list/.clean и т.п. — их в
+    # скрипте много, и они не завёрнуты в _rich_bypass поштучно) не трогаем.
+    if not getattr(event.message, 'media', None):
+        return
+    await _process_richtext(event)
 
 
 #
