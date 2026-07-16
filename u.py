@@ -259,6 +259,33 @@ ban_enabled = True
 # Разрешённые телефонные префиксы (без "+"): Украина, Россия (код 7 общий с Казахстаном)
 ALLOWED_PHONE_PREFIXES = ('380', '7')
 
+# Телефонные коды стран (для отчёта в .ban — "что за номер"). Не исчерпывающе,
+# но покрывает основные страны; неизвестные коды репортятся как есть.
+PHONE_COUNTRY_CODES = {
+    '380': 'Украина', '375': 'Беларусь', '374': 'Армения', '373': 'Молдова',
+    '372': 'Эстония', '371': 'Латвия', '370': 'Литва', '994': 'Азербайджан',
+    '995': 'Грузия', '996': 'Киргизия', '998': 'Узбекистан', '992': 'Таджикистан',
+    '993': 'Туркменистан', '7': 'Россия/Казахстан',
+    '1': 'США/Канада', '44': 'Великобритания', '49': 'Германия', '33': 'Франция',
+    '34': 'Испания', '39': 'Италия', '31': 'Нидерланды', '32': 'Бельгия',
+    '41': 'Швейцария', '43': 'Австрия', '48': 'Польша', '420': 'Чехия',
+    '421': 'Словакия', '36': 'Венгрия', '40': 'Румыния', '359': 'Болгария',
+    '385': 'Хорватия', '386': 'Словения', '381': 'Сербия', '30': 'Греция',
+    '351': 'Португалия', '352': 'Люксембург', '353': 'Ирландия', '354': 'Исландия',
+    '358': 'Финляндия', '45': 'Дания', '46': 'Швеция', '47': 'Норвегия',
+    '90': 'Турция', '20': 'Египет', '212': 'Марокко', '213': 'Алжир',
+    '216': 'Тунис', '234': 'Нигерия', '233': 'Гана', '254': 'Кения',
+    '27': 'ЮАР', '251': 'Эфиопия', '256': 'Уганда', '255': 'Танзания',
+    '86': 'Китай', '81': 'Япония', '82': 'Южная Корея', '91': 'Индия',
+    '92': 'Пакистан', '880': 'Бангладеш', '84': 'Вьетнам', '66': 'Таиланд',
+    '63': 'Филиппины', '62': 'Индонезия', '60': 'Малайзия', '65': 'Сингапур',
+    '972': 'Израиль', '971': 'ОАЭ', '966': 'Саудовская Аравия', '974': 'Катар',
+    '965': 'Кувейт', '962': 'Иордания', '961': 'Ливан', '964': 'Ирак',
+    '98': 'Иран', '93': 'Афганистан', '52': 'Мексика', '55': 'Бразилия',
+    '54': 'Аргентина', '56': 'Чили', '57': 'Колумбия', '58': 'Венесуэла',
+    '51': 'Перу', '61': 'Австралия', '64': 'Новая Зеландия',
+}
+
 MAX_BANNED_CACHE = 1000
 banned_cache = set()
 
@@ -894,9 +921,11 @@ async def _convert_via_richbot(text: str):
                 # parse_mode=None — шлём как есть, без интерпретации markdown/html,
                 # иначе теги <h3> или спецсимволы markdown исказят то, что видит бот.
                 sent = await conv.send_message(payload, parse_mode=None)
+                print(f'[richtext] отправил боту id={getattr(sent, "id", "?")}: {payload[:60]!r}')
                 if sent is not None and getattr(sent, 'id', None):
                     _rich_skip_ids.add(sent.id)
                 resp = await conv.get_response()
+                print(f'[richtext] получил от бота id={resp.id}: {(resp.message or "")[:60]!r} entities={len(resp.entities or [])}')
         finally:
             _rich_bypass = False
     result_text = resp.raw_text if resp.raw_text else resp.message
@@ -975,13 +1004,16 @@ async def handle_richtext(event):
         return
     # Уже есть разметка (в т.ч. рич-шрифт) — не трогаем повторно
     if getattr(event.message, 'entities', None):
+        print(f'[richtext] пропуск (уже есть entities): {text[:60]!r}')
         return
     # Автокомментарии под постами не конвертируем
     if text.strip() in COMMENTS:
         return
+    print(f'[richtext] обрабатываю сообщение id={event.id}: {text[:60]!r}')
     try:
         bot_entity = await _get_richbot_entity()
     except Exception as e:
+        print(f'[richtext] резолв @Text2RichBot упал: {e!r}')
         await _debug_notify('резолв @Text2RichBot', e)
         return
     if bot_entity is None:
@@ -995,13 +1027,17 @@ async def handle_richtext(event):
     try:
         result_text, result_entities = await _convert_via_richbot(text)
     except Exception as e:
+        print(f'[richtext] запрос к боту упал: {e!r}')
         await _debug_notify('запрос к @Text2RichBot', e)
         return
+    print(f'[richtext] ответ бота: {result_text[:60]!r} entities={len(result_entities or [])}' if result_text else '[richtext] пустой ответ бота')
     if not result_text:
         return
     try:
-        await event.message.edit(result_text, formatting_entities=result_entities)
+        edited = await event.message.edit(result_text, formatting_entities=result_entities)
+        print(f'[richtext] edit OK, новый message.id={getattr(edited, "id", "?")}')
     except Exception as e:
+        print(f'[richtext] edit упал: {e!r}')
         await _debug_notify('edit сообщения', e)
 
 
@@ -1022,6 +1058,18 @@ def _phone_is_allowed(phone) -> bool:
     if not phone:
         return False
     return any(phone.startswith(p) for p in ALLOWED_PHONE_PREFIXES)
+
+
+def _phone_country_name(phone) -> str:
+    """Определяет страну по коду номера (для отчёта), самый длинный код — приоритет."""
+    phone = (phone or '').lstrip('+')
+    if not phone:
+        return 'скрыт/анонимный'
+    for length in (3, 2, 1):
+        code = phone[:length]
+        if code in PHONE_COUNTRY_CODES:
+            return f'{PHONE_COUNTRY_CODES[code]} (+{code})'
+    return f'неизвестная страна (+{phone[:3]})'
 
 
 @client.on(events.NewMessage(pattern=r'^\.ban$', outgoing=True))
@@ -1077,10 +1125,11 @@ async def handle_autoban_numbers(event):
         return
     name = utils.get_display_name(sender)
     username = f'@{sender.username}' if getattr(sender, 'username', None) else '—'
+    phone_line = f'{phone} — {_phone_country_name(phone)}' if phone else _phone_country_name(phone)
     report = (
         f'Автобан по номеру\n'
         f'Кто: {name} ({username}, id {sender.id})\n'
-        f'Номер: {phone or "скрыт/анонимный"}\n'
+        f'Номер: {phone_line}\n'
         f'Написал: {event.raw_text or "[медиа/без текста]"}'
     )
     try:
