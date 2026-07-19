@@ -1126,6 +1126,10 @@ async def _process_richtext(event):
         return
     if not richtext_enabled or _rich_bypass:
         return
+    # Пересланные сообщения не трогаем: их нельзя редактировать
+    # (EditMessageRequest → "message ID is invalid or you can't do that").
+    if getattr(event.message, 'fwd_from', None):
+        return
     # event.message.message — это и обычный текст, и подпись под фото/видео,
     # поэтому подписи под медиа обрабатываются тем же путём без спецкода.
     text = getattr(event.message, 'message', None) or ''
