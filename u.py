@@ -5,7 +5,6 @@ import os
 import re
 import sqlite3
 import sys
-import traceback
 import gc
 import base64
 import io
@@ -13,19 +12,15 @@ import random
 import time
 import html
 import logging
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, functions, errors, utils
 from telethon.sessions import StringSession
-from telethon.tl.functions.channels import EditBannedRequest, GetFullChannelRequest, JoinChannelRequest, LeaveChannelRequest
-from telethon.tl.functions.messages import DeleteChatUserRequest
-from telethon.tl.functions.folders import EditPeerFoldersRequest
-from telethon.tl.functions.account import UpdateNotifySettingsRequest
+from telethon.tl.functions.channels import GetFullChannelRequest, JoinChannelRequest, LeaveChannelRequest
 from telethon.tl.types import (
-    ChatBannedRights, MessageEntityCustomEmoji, PeerChannel, PeerChat,
-    InputFolderPeer, InputNotifyPeer, InputPeerNotifySettings, InputRichMessageHTML,
+    MessageEntityCustomEmoji, PeerChannel, PeerChat, InputRichMessageHTML,
 )
-import psycopg2
-from concurrent.futures import ThreadPoolExecutor
 
 # 
 # ПОДАВЛЯЕМ СПАМ ЛОГОВ TELETHON
@@ -67,49 +62,10 @@ GLOBAL_PER_MIN = int(os.getenv('GLOBAL_PER_MIN', '5'))                # макс
 GLOBAL_PER_HOUR = int(os.getenv('GLOBAL_PER_HOUR', '40'))             # макс комментов в час суммарно
 THINKING_EMOJI_ID = 5454074580010295588
 DELALL_EMOJI_ID = 5219901967916084166
-DATABASE_URL = os.getenv('DATABASE_URL')
-GROQ_API_KEY = os.getenv('GROQ_API_KEY', '')
-
-# Локальная транскрибация (faster-whisper, бесплатно, без API) 
-# Ограничиваем потоки CPU-математики до загрузки faster-whisper — иначе
-# CTranslate2/OpenMP резервируют пул потоков на каждое ядро, что на контейнере
-# с 512MB приводит к OOM.
-os.environ.setdefault('OMP_NUM_THREADS', '1')
-os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
-
-# Модель НЕ грузится при старте: ~300MB ("small") убивают контейнер по памяти
-# ещё до готовности бота → бесконечный рестарт. Грузим лениво при первом
-# голосовом. По умолчанию "tiny" (~75MB); переопределяется env WHISPER_MODEL.
-WHISPER_MODEL_NAME = os.getenv('WHISPER_MODEL', 'tiny')
-_whisper_model = None
-try:
-    from faster_whisper import WhisperModel as _WhisperModel
-    _whisper_executor = ThreadPoolExecutor(max_workers=1)
-    WHISPER_AVAILABLE = True
-    print(f'faster-whisper подключён (модель «{WHISPER_MODEL_NAME}» загрузится при первом гс)')
-except Exception as _e:
-    _WhisperModel = None
-    _whisper_executor = None
-    WHISPER_AVAILABLE = False
-    print(f'faster-whisper недоступен: {_e}\n   Установи: pip install faster-whisper')
-
-def _get_whisper_model():
-    """Лениво создаёт модель Whisper при первом обращении (экономия памяти)."""
-    global _whisper_model
-    if _whisper_model is None and _WhisperModel is not None:
-        _whisper_model = _WhisperModel(
-            WHISPER_MODEL_NAME,
-            device="cpu",
-            compute_type="int8",
-            cpu_threads=1,
-            num_workers=1,
-        )
-        print(f'faster-whisper модель «{WHISPER_MODEL_NAME}» загружена')
-    return _whisper_model
+DB_PATH = os.getenv('DB_PATH', 'ub158.db')
 
 # Интервал автоочистки комментариев — 3 дня
 AUTO_CLEAN_INTERVAL = 3 * 24 * 3600
-AUTO_CLEAN_STATE_FILE = "autoclean_state.json"
 
 COMMENTS = [
     'гад факин дэээм',
@@ -232,29 +188,28 @@ def _record_comment(channel_id):
     _last_comment_per_channel[channel_id] = now
     _recent_comment_times.append(now)
 
-state_file = "kick_state.json"
 kick_enabled = False
-gs_enabled = False
+# Автокомменты под постами (.kn / .kf) — по умолчанию ВКЛ
+comments_enabled = True
+# Дозапись промо-строки к автокомментарию через 5 минут после отправки (.ff / .fff)
+ff_enabled = False
+FF_DELAY = 5 * 60
+FF_PROMO_TEXT = 'скрытые гифты можно смотреть тут musikappbot'
 baseline_hashes = set()
 monitor_task = None
 
-# Рич-текст через @Text2RichBot (.on/.off, .sh1/.sh2)
+# Рич-текст (.on/.off, .sh1/.sh2) — строим rich_message сами через
+# messages.EditMessageRequest(rich_message=InputRichMessageHTML(...)),
+# без стороннего бота-посредника (раньше шло через @Text2RichBot).
 richtext_enabled = False
-RICHBOT_USERNAME = os.getenv('RICHBOT_USERNAME', 'Text2RichBot').lstrip('@')
-_richbot_entity_cache = None
-_richbot_prepared = False  # архивация+мут чата с ботом сделаны один раз
-_rich_lock = asyncio.Lock()
-# Обход перехвата для исходящих, которые шлёт сам код (запрос к боту,
-# автокомменты и т.п.) — иначе сообщение само себе зациклится на конвертацию.
+# Обход перехвата для исходящих, которые шлёт сам код (автокомменты и
+# т.п.) — иначе сообщение само себе зациклится на конвертацию.
 _rich_bypass = False
 _rich_skip_ids = set()
 # Тег стиля, которым оборачивается текст перед отправкой боту:
 # None -> обычный (.sh1), 'h3' -> <h3>текст</h3> (.sh2)
 _rich_style_tag = None
 _rich_last_error_ts = 0
-
-MAX_BANNED_CACHE = 1000
-banned_cache = set()
 
 auto_delete_delay_map = {}
 auto_delete_enabled_map = {}
@@ -263,33 +218,157 @@ auto_delete_worker_map = {}
 
 autoclean_task = None
 
-# 
+# Время в нике (.t on / .t off)
+TIME_NICK_TZ = ZoneInfo("Europe/Vienna")
+TIME_NICK_STATE_FILE = "time_nick_state.json"
+# суффикс вида " [08:45]" в самом конце имени
+_TIME_SUFFIX_RE = re.compile(r'\s\[\d{2}:\d{2}\]$')
+
+time_nick_enabled = False
+time_nick_base_name = None   # ник без суффикса времени
+time_nick_task = None
+
+
+def _load_time_nick_state():
+    """Читает state из JSON-файла (переживает рестарт юзербота)."""
+    global time_nick_enabled, time_nick_base_name
+    try:
+        with open(TIME_NICK_STATE_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        time_nick_enabled = bool(data.get('enabled', False))
+        time_nick_base_name = data.get('base_name')
+    except Exception:
+        time_nick_enabled = False
+        time_nick_base_name = None
+
+
+def _save_time_nick_state():
+    try:
+        with open(TIME_NICK_STATE_FILE, 'w', encoding='utf-8') as f:
+            json.dump({'enabled': time_nick_enabled, 'base_name': time_nick_base_name}, f)
+    except Exception:
+        pass
+
+_load_time_nick_state()  # поднимаем state сразу при импорте модуля
+
+
+async def _time_nick_loop():
+    """Раз в минуту (синхронно со сменой минуты) переписывает first_name
+    на '<база> [HH:MM]' по Вене. Первое обновление — сразу при входе."""
+    global time_nick_base_name
+    try:
+        while True:
+            try:
+                me = await client.get_me()
+                current_name = me.first_name or ''
+            except errors.FloodWaitError as e:
+                await asyncio.sleep(e.seconds)
+                continue
+            except Exception as e:
+                print(f'[time_nick] get_me error: {e}')
+                current_name = (time_nick_base_name or '')
+
+            # ник могли сменить руками, пока функция включена — новая база
+            current_base = _TIME_SUFFIX_RE.sub('', current_name)
+            if current_base != (time_nick_base_name or ''):
+                time_nick_base_name = current_base
+                _save_time_nick_state()
+
+            now = datetime.now(TIME_NICK_TZ)
+            suffix = f' [{now.strftime("%H:%M")}]'
+            # лимит 64 символа — обрезаем базу, не суффикс
+            base = (time_nick_base_name or '')[:64 - len(suffix)]
+            new_name = base + suffix
+
+            if new_name != current_name:
+                try:
+                    await client(functions.account.UpdateProfileRequest(first_name=new_name))
+                except errors.FloodWaitError as e:
+                    await asyncio.sleep(e.seconds)
+                except Exception as e:
+                    print(f'[time_nick] update error: {e}')
+
+            now2 = datetime.now(TIME_NICK_TZ)
+            delay = 60 - now2.second - now2.microsecond / 1_000_000
+            await asyncio.sleep(max(delay, 0.1))
+    except asyncio.CancelledError:
+        return
+
+
+@client.on(events.NewMessage(pattern=r'(?i)^\s*\.t\s+on\s*$', outgoing=True))
+async def cmd_time_nick_on(event):
+    if event.sender_id != OWNER_ID:
+        return
+    global time_nick_enabled, time_nick_base_name, time_nick_task
+    if not (time_nick_enabled and time_nick_task and not time_nick_task.done()):
+        try:
+            me = await client.get_me()
+            time_nick_base_name = _TIME_SUFFIX_RE.sub('', me.first_name or '')
+        except Exception as e:
+            print(f'[time_nick] .t on get_me error: {e}')
+            time_nick_base_name = time_nick_base_name or ''
+        time_nick_enabled = True
+        _save_time_nick_state()
+        time_nick_task = asyncio.create_task(_time_nick_loop())
+    try:
+        await event.message.delete()
+    except Exception:
+        pass
+
+
+@client.on(events.NewMessage(pattern=r'(?i)^\s*\.t\s+off\s*$', outgoing=True))
+async def cmd_time_nick_off(event):
+    if event.sender_id != OWNER_ID:
+        return
+    global time_nick_enabled, time_nick_task
+    time_nick_enabled = False
+    if time_nick_task and not time_nick_task.done():
+        time_nick_task.cancel()
+        try:
+            await time_nick_task
+        except asyncio.CancelledError:
+            pass
+    time_nick_task = None
+
+    base = time_nick_base_name or ''
+    try:
+        me = await client.get_me()
+        if (me.first_name or '') != base:
+            await client(functions.account.UpdateProfileRequest(first_name=base))
+    except errors.FloodWaitError as e:
+        await asyncio.sleep(e.seconds)
+        try:
+            await client(functions.account.UpdateProfileRequest(first_name=base))
+        except Exception as e:
+            print(f'[time_nick] .t off retry error: {e}')
+    except Exception as e:
+        print(f'[time_nick] .t off update error: {e}')
+
+    _save_time_nick_state()
+    try:
+        await event.message.delete()
+    except Exception:
+        pass
+
+#
 # БАЗА ДАННЫХ
 # 
 
 def get_db_connection():
-    """Получает соединение с PostgreSQL."""
-    if not DATABASE_URL:
-        return None
-    return psycopg2.connect(DATABASE_URL, sslmode='require')
+    """Получает соединение с локальной SQLite-базой."""
+    return sqlite3.connect(DB_PATH)
 
 def init_db():
     """Инициализирует таблицы в БД (каналы + настройки рантайма)."""
     conn = get_db_connection()
-    if not conn:
-        return
     cur = conn.cursor()
     try:
         cur.execute('''
             CREATE TABLE IF NOT EXISTS channels (
-                channel_id BIGINT PRIMARY KEY,
+                channel_id INTEGER PRIMARY KEY,
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        # Настройки (last_clean, kick_state и т.п.) — в БД, а не в локальном
-        # файле: на Render/Railway диск контейнера эфемерный и очищается на
-        # каждом деплое, из-за чего файл всегда "пустой" после редеплоя и
-        # автоочистка/тумблеры сбрасывались бы каждый раз.
         cur.execute('''
             CREATE TABLE IF NOT EXISTS bot_settings (
                 key TEXT PRIMARY KEY,
@@ -307,11 +386,9 @@ def init_db():
 def get_setting(key, default=None):
     """Читает значение настройки из БД."""
     conn = get_db_connection()
-    if not conn:
-        return default
     cur = conn.cursor()
     try:
-        cur.execute('SELECT value FROM bot_settings WHERE key = %s', (key,))
+        cur.execute('SELECT value FROM bot_settings WHERE key = ?', (key,))
         row = cur.fetchone()
         return row[0] if row else default
     except Exception as e:
@@ -324,13 +401,11 @@ def get_setting(key, default=None):
 def set_setting(key, value):
     """Записывает значение настройки в БД."""
     conn = get_db_connection()
-    if not conn:
-        return False
     cur = conn.cursor()
     try:
         cur.execute(
-            'INSERT INTO bot_settings (key, value) VALUES (%s, %s) '
-            'ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value',
+            'INSERT INTO bot_settings (key, value) VALUES (?, ?) '
+            'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
             (key, value)
         )
         conn.commit()
@@ -346,8 +421,6 @@ def set_setting(key, value):
 def load_channels():
     """Загружает список каналов из БД."""
     conn = get_db_connection()
-    if not conn:
-        return []
     cur = conn.cursor()
     try:
         cur.execute('SELECT channel_id FROM channels')
@@ -362,11 +435,9 @@ def load_channels():
 def add_channel_db(channel_id):
     """Добавляет канал в БД."""
     conn = get_db_connection()
-    if not conn:
-        return False
     cur = conn.cursor()
     try:
-        cur.execute('INSERT INTO channels (channel_id) VALUES (%s) ON CONFLICT DO NOTHING', (channel_id,))
+        cur.execute('INSERT INTO channels (channel_id) VALUES (?) ON CONFLICT DO NOTHING', (channel_id,))
         conn.commit()
         return True
     except Exception as e:
@@ -380,12 +451,10 @@ def add_channel_db(channel_id):
 def remove_channel_db(channel_id):
     """Удаляет канал из БД."""
     conn = get_db_connection()
-    if not conn:
-        return False
     cur = None
     try:
         cur = conn.cursor()
-        cur.execute('DELETE FROM channels WHERE channel_id = %s', (channel_id,))
+        cur.execute('DELETE FROM channels WHERE channel_id = ?', (channel_id,))
         deleted = cur.rowcount > 0
         conn.commit()
         return deleted
@@ -403,32 +472,16 @@ def remove_channel_db(channel_id):
 # 
 
 def load_autoclean_state():
-    """Загружает время последней автоочистки (БД — переживает редеплой;
-    локальный файл — только запасной вариант для дев-режима без Postgres)."""
-    if DATABASE_URL:
-        raw = get_setting('last_clean')
-        try:
-            return float(raw) if raw is not None else 0
-        except (TypeError, ValueError):
-            return 0
-    if os.path.exists(AUTO_CLEAN_STATE_FILE):
-        try:
-            with open(AUTO_CLEAN_STATE_FILE, 'r') as f:
-                return json.load(f).get('last_clean', 0)
-        except Exception:
-            pass
-    return 0
+    """Загружает время последней автоочистки из БД (переживает передеплой)."""
+    raw = get_setting('last_clean')
+    try:
+        return float(raw) if raw is not None else 0
+    except (TypeError, ValueError):
+        return 0
 
 def save_autoclean_state(ts):
-    """Сохраняет время последней автоочистки (БД, иначе локальный файл)."""
-    if DATABASE_URL:
-        set_setting('last_clean', str(ts))
-        return
-    try:
-        with open(AUTO_CLEAN_STATE_FILE, 'w') as f:
-            json.dump({'last_clean': ts}, f)
-    except Exception:
-        pass
+    """Сохраняет время последней автоочистки в БД."""
+    set_setting('last_clean', str(ts))
 
 def _to_peer_id(cid):
     """Преобразует ID канала в peer_id."""
@@ -551,55 +604,22 @@ async def _delete_later(messages, delay):
             except Exception:
                 pass
 
-async def _perform_ban(chat, target, target_user, rights):
-    """Выполняет бан пользователя."""
-    try:
-        if getattr(chat, 'access_hash', None) is not None and target_user is not None:
-            try:
-                await client(EditBannedRequest(chat, target_user, rights))
-                return True
-            except Exception:
-                pass
-        try:
-            await client(DeleteChatUserRequest(chat_id=chat.id, user_id=target))
-            return True
-        except Exception:
-            pass
-        return False
-    except Exception:
-        return False
-
-async def _delete_user_messages_if_needed(chat, target, ban_future):
-    """Удаляет сообщения пользователя после бана."""
-    try:
-        ban_succeeded = await ban_future
-    except Exception:
-        ban_succeeded = False
-    if not ban_succeeded:
-        return
-    if target in banned_cache:
+async def _append_ff_promo_later(message, delay):
+    """Дописывает промо-строку к автокомментарию через delay секунд (.ff/.fff)."""
+    await asyncio.sleep(delay)
+    if not ff_enabled:
+        print(f'[ff] пропуск правки msg id={message.id}: .ff выключен')
         return
     try:
-        ids = []
-        async for msg in client.iter_messages(chat, from_user=target, limit=500):
-            ids.append(msg.id)
-            if len(ids) >= 100:
-                await client.delete_messages(chat, ids, revoke=True)
-                ids = []
-                await asyncio.sleep(0.1)
-        if ids:
-            await client.delete_messages(chat, ids, revoke=True)
-        if len(banned_cache) >= MAX_BANNED_CACHE:
-            try:
-                banned_cache.pop()
-            except KeyError:
-                pass
-        banned_cache.add(target)
-        gc.collect()
-    except Exception:
-        pass
+        current_text = getattr(message, 'message', None) or ''
+        await message.edit(f'{current_text}\n{FF_PROMO_TEXT}')
+        print(f'[ff] дописал промо к msg id={message.id} chat={message.chat_id}')
+    except errors.MessageNotModifiedError:
+        print(f'[ff] msg id={message.id}: MessageNotModifiedError (уже с этим текстом?)')
+    except Exception as e:
+        print(f'[ff] не смог дописать промо к msg id={message.id} chat={message.chat_id}: {e!r}')
 
-# 
+#
 # ФОРМАТИРОВАНИЕ И ЭМОДЗИ
 # 
 
@@ -644,50 +664,41 @@ def clean(t):
 # 
 
 async def load_kick_state():
-    """Загружает состояние автокика / гс / рич-текста / автобана.
-
-    Источник — БД (переживает редеплой на Render/Railway, где локальный диск
-    контейнера эфемерный); локальный файл — запасной вариант для дев-режима
-    без Postgres (DATABASE_URL не задан).
-    """
-    global kick_enabled, baseline_hashes, gs_enabled, richtext_enabled, _rich_style_tag
+    """Загружает состояние автокика / рич-текста / автобана из БД (переживает передеплой)."""
+    global kick_enabled, baseline_hashes, comments_enabled, richtext_enabled, _rich_style_tag, ff_enabled
     data = {}
     try:
-        if DATABASE_URL:
-            raw = get_setting('kick_state')
-            if raw:
-                data = json.loads(raw)
-        elif os.path.exists(state_file):
-            with open(state_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
+        raw = get_setting('kick_state')
+        if raw:
+            data = json.loads(raw)
         kick_enabled = bool(data.get("kick_enabled", False))
-        gs_enabled = bool(data.get("gs_enabled", False))
+        # default True — если ключа ещё нет, комменты продолжают работать как раньше
+        comments_enabled = bool(data.get("comments_enabled", True))
         richtext_enabled = bool(data.get("richtext_enabled", False))
         _rich_style_tag = data.get("rich_style_tag") or None
         baseline_hashes = set(data.get("baseline_hashes", []))
+        ff_enabled = bool(data.get("ff_enabled", False))
     except Exception:
         kick_enabled = False
-        gs_enabled = False
+        comments_enabled = True
         richtext_enabled = False
         _rich_style_tag = None
         baseline_hashes = set()
+        ff_enabled = False
 
 async def save_kick_state():
-    """Сохраняет состояние автокика / гс / рич-текста (БД, иначе локальный файл)."""
-    global kick_enabled, baseline_hashes, gs_enabled, richtext_enabled, _rich_style_tag
+    """Сохраняет состояние автокика / комментов / рич-текста в БД."""
+    global kick_enabled, baseline_hashes, comments_enabled, richtext_enabled, _rich_style_tag, ff_enabled
     payload = {
         "kick_enabled": bool(kick_enabled),
-        "gs_enabled": bool(gs_enabled),
+        "comments_enabled": bool(comments_enabled),
         "richtext_enabled": bool(richtext_enabled),
         "rich_style_tag": _rich_style_tag,
         "baseline_hashes": list(baseline_hashes),
+        "ff_enabled": bool(ff_enabled),
     }
     try:
-        if DATABASE_URL:
-            set_setting('kick_state', json.dumps(payload))
-        else:
-            with open(state_file, "w", encoding="utf-8") as f:
-                json.dump(payload, f)
+        set_setting('kick_state', json.dumps(payload))
     except Exception:
         pass
 
@@ -788,42 +799,63 @@ async def cmd_disable(event):
         await loading.edit(f"Ошибка: {e}")
     _cleanup5(event, loading)
 
-@client.on(events.NewMessage(pattern=r'^\.gn$', outgoing=True))
-async def cmd_gs_on(event):
-    """Включает функцию голосовой транскрибации."""
+@client.on(events.NewMessage(pattern=r'^\.kn$', outgoing=True))
+async def cmd_comments_on(event):
+    """Включает автокомменты под постами во всех отслеживаемых каналах."""
     if event.sender_id != OWNER_ID:
         return
-    global gs_enabled
-    gs_enabled = True
+    global comments_enabled
+    comments_enabled = True
+    await save_kick_state()
+    resp = await event.reply("автокомменты включены")
+    _cleanup5(event, resp)
+
+
+@client.on(events.NewMessage(pattern=r'^\.kf$', outgoing=True))
+async def cmd_comments_off(event):
+    """Выключает автокомменты под постами (список каналов не трогает)."""
+    if event.sender_id != OWNER_ID:
+        return
+    global comments_enabled
+    comments_enabled = False
+    await save_kick_state()
+    resp = await event.reply("автокомменты выключены")
+    _cleanup5(event, resp)
+
+
+@client.on(events.NewMessage(pattern=r'^\.ff$', outgoing=True))
+async def cmd_ff_on(event):
+    """Включает дозапись промо-строки к автокомментарию через 5 минут."""
+    if event.sender_id != OWNER_ID:
+        return
+    global ff_enabled
+    ff_enabled = True
     await save_kick_state()
     resp = await event.reply("успешно")
     _cleanup5(event, resp)
 
-@client.on(events.NewMessage(pattern=r'^\.gf$', outgoing=True))
-async def cmd_gs_off(event):
-    """Выключает функцию голосовой транскрибации."""
+
+@client.on(events.NewMessage(pattern=r'^\.fff$', outgoing=True))
+async def cmd_ff_off(event):
+    """Выключает дозапись промо-строки к автокомментарию."""
     if event.sender_id != OWNER_ID:
         return
-    global gs_enabled
-    gs_enabled = False
+    global ff_enabled
+    ff_enabled = False
     await save_kick_state()
     resp = await event.reply("успешно")
     _cleanup5(event, resp)
 
 
 #
-# РИЧ-ТЕКСТ ЧЕРЕЗ @Text2RichBot
+# РИЧ-ТЕКСТ
 # .on  — включает: каждое твоё обычное сообщение (текст или подпись под
-#        фото/видео) уходит боту в личку, ответ бота (с его форматированием)
-#        подставляется на место твоего исходного сообщения через edit.
+#        фото/видео) переоформляется в rich_message через edit того же
+#        сообщения (см. _build_rich_html).
 # .off — выключает.
-# .sh1 — обычный стиль (текст шлётся боту как есть).
-# .sh2 — стиль h3 (текст перед отправкой боту оборачивается в <h3>...</h3> —
-#        это собственный синтаксис самого бота для выбора шрифта, а не
-#        HTML-разметка Telegram).
-# Не трогаем: команды (.xxx), автокомментарии, уже отформатированные
-# сообщения и переписку с самим ботом (чтобы не зациклиться). Чат с ботом
-# при первом обращении архивируется и заглушается, чтобы не мозолил глаза.
+# .sh1 — обычный стиль (текст оборачивается в <p>).
+# .sh2 — стиль h3 (текст оборачивается в <h3>...</h3>).
+# Не трогаем: команды (.xxx), автокомментарии, уже отформатированные сообщения.
 #
 
 async def _debug_notify(context: str, err):
@@ -849,198 +881,25 @@ async def _debug_notify(context: str, err):
         _rich_bypass = False
 
 
-async def _prepare_richbot_dialog(bot_entity):
-    """Архивирует и заглушает чат с ботом (один раз)."""
-    global _richbot_prepared
-    if _richbot_prepared:
-        return
-    _richbot_prepared = True
-    try:
-        input_peer = await client.get_input_entity(bot_entity)
-        await client(EditPeerFoldersRequest(
-            folder_peers=[InputFolderPeer(peer=input_peer, folder_id=1)]
-        ))
-        await client(UpdateNotifySettingsRequest(
-            peer=InputNotifyPeer(peer=input_peer),
-            settings=InputPeerNotifySettings(mute_until=2 ** 31 - 1)
-        ))
-    except Exception:
-        pass
+
+# rich_message — официальный формат Telegram (Bot API 10.1, "Rich Message
+# formatting"): HTML на входе, отрисовывается как заголовки/цитаты/т.п.
+# Раньше текст гоняли через @Text2RichBot, чтобы получить готовый rich_message
+# и скопировать его на своё сообщение — бот отвалился. Строим HTML сами:
+# ровно то же самое, что мы и так собирали в качестве запроса боту.
+
+def _build_rich_html(text: str, style_tag: str | None) -> str:
+    """Оборачивает текст в HTML-тег стиля для rich_message (без стороннего бота)."""
+    safe_text = html.escape(text).replace('\n', '<br>')
+    tag = style_tag or 'p'
+    return f'<{tag}>{safe_text}</{tag}>'
 
 
-async def _get_richbot_entity():
-    """Резолвит и кэширует entity @Text2RichBot."""
-    global _richbot_entity_cache
-    if _richbot_entity_cache is None:
-        entity = await client.get_entity(RICHBOT_USERNAME)
-        await _prepare_richbot_dialog(entity)
-        _richbot_entity_cache = entity
-    return _richbot_entity_cache
-
-
-# Ответ Text2RichBot приходит не обычным текстом, а через отдельное поле
-# rich_message (новая система Telegram "Rich Message": HTML/Markdown на входе
-# -> дерево блоков TypePageBlock на выходе, та же модель что у Telegraph).
-# Ниже — конвертер этих блоков обратно в HTML, чтобы отправить его же через
-# EditMessageRequest(rich_message=InputRichMessageHTML(...)) при правке.
-
-_RICHTEXT_TAG_HTML = {
-    'TextBold': 'b', 'TextItalic': 'i', 'TextUnderline': 'u',
-    'TextStrike': 's', 'TextFixed': 'code', 'TextMarked': 'b',
-    'TextSubscript': 'sub', 'TextSuperscript': 'sup',
-}
-
-_HEADING_BLOCK_TAGS = {
-    'PageBlockHeading1': 'h1', 'PageBlockHeading2': 'h2', 'PageBlockHeading3': 'h3',
-    'PageBlockHeading4': 'h4', 'PageBlockHeading5': 'h5', 'PageBlockHeading6': 'h6',
-    'PageBlockTitle': 'h1', 'PageBlockHeader': 'h2', 'PageBlockSubheader': 'h3',
-    'PageBlockSubtitle': 'h4',
-}
-
-
-def _richtext_to_html(rt) -> str:
-    """Рекурсивно рендерит дерево TypeRichText в HTML."""
-    if rt is None:
-        return ''
-    cls = type(rt).__name__
-    if cls == 'TextPlain':
-        # \n внутри текстового узла — это реальный перенос строки, но при
-        # рендере в HTML его нужно явно превратить в <br>, иначе он
-        # схлопнется в пробел при парсинге HTML на другой стороне.
-        return html.escape(rt.text or '').replace('\n', '<br>')
-    if cls == 'TextConcat':
-        return ''.join(_richtext_to_html(t) for t in (rt.texts or []))
-    if cls in _RICHTEXT_TAG_HTML:
-        tag = _RICHTEXT_TAG_HTML[cls]
-        return f'<{tag}>{_richtext_to_html(rt.text)}</{tag}>'
-    if cls == 'TextUrl':
-        return f'<a href="{html.escape(rt.url or "")}">{_richtext_to_html(rt.text)}</a>'
-    if cls == 'TextEmail':
-        return f'<a href="mailto:{html.escape(rt.email or "")}">{_richtext_to_html(rt.text)}</a>'
-    if cls in ('TextAnchor', 'TextPhone'):
-        return _richtext_to_html(getattr(rt, 'text', None))
-    if cls in ('TextEmpty', 'TextImage'):
-        return ''
-    # Неизвестный тип — берём вложенный .text, если есть
-    return _richtext_to_html(getattr(rt, 'text', None)) if hasattr(rt, 'text') else ''
-
-
-def _richtext_plain(rt) -> str:
-    """Рекурсивно достаёт чистый текст без разметки (фоллбек для message=)."""
-    if rt is None:
-        return ''
-    cls = type(rt).__name__
-    if cls == 'TextPlain':
-        return rt.text or ''
-    if cls == 'TextConcat':
-        return ''.join(_richtext_plain(t) for t in (rt.texts or []))
-    if hasattr(rt, 'text'):
-        return _richtext_plain(rt.text)
-    return ''
-
-
-def _page_block_to_html(block) -> str:
-    cls = type(block).__name__
-    if cls in _HEADING_BLOCK_TAGS:
-        tag = _HEADING_BLOCK_TAGS[cls]
-        return f'<{tag}>{_richtext_to_html(block.text)}</{tag}>'
-    if cls == 'PageBlockParagraph':
-        return f'<p>{_richtext_to_html(block.text)}</p>'
-    if cls in ('PageBlockBlockquote', 'PageBlockPullquote'):
-        return f'<blockquote>{_richtext_to_html(block.text)}</blockquote>'
-    if cls == 'PageBlockPreformatted':
-        return f'<pre>{_richtext_to_html(block.text)}</pre>'
-    if cls in ('PageBlockKicker', 'PageBlockFooter', 'PageBlockAuthorDate'):
-        return f'<p>{_richtext_to_html(block.text)}</p>'
-    if cls in ('PageBlockList', 'PageBlockOrderedList'):
-        tag = 'ol' if cls == 'PageBlockOrderedList' else 'ul'
-        items = ''.join(
-            f'<li>{_richtext_to_html(getattr(it, "text", None))}</li>'
-            for it in (block.items or []) if hasattr(it, 'text')
-        )
-        return f'<{tag}>{items}</{tag}>' if items else ''
-    if cls == 'PageBlockDivider':
-        return '<hr>'
-    # Медиа/неподдерживаемые блоки (фото, таблицы, embed и т.п.) — пропускаем,
-    # текст важнее, чем эти вложения, которые мы всё равно не можем скопировать.
-    return ''
-
-
-def _rich_message_to_html(rich_message) -> str:
-    blocks = getattr(rich_message, 'blocks', None) or []
-    return ''.join(_page_block_to_html(b) for b in blocks)
-
-
-def _rich_message_to_plain(rich_message) -> str:
-    blocks = getattr(rich_message, 'blocks', None) or []
-    parts = [_richtext_plain(getattr(b, 'text', None)) for b in blocks if hasattr(b, 'text')]
-    return '\n'.join(p for p in parts if p)
-
-
-async def _ask_richbot(bot_entity, payload: str):
-    """Один запрос-ответ боту.
-
-    Возвращает (текст, entities, rich_html):
-      - если бот ответил обычным текстом — (текст, entities, None);
-      - если бот ответил через rich_message — (текст-фоллбек, None, html);
-      - если ответа по существу нет — (None, None, None).
-    """
-    global _rich_bypass, _rich_skip_ids
-    async with _rich_lock:
-        _rich_bypass = True
-        try:
-            async with client.conversation(bot_entity, timeout=20, total_timeout=25) as conv:
-                # parse_mode=None — шлём как есть, без интерпретации markdown/html,
-                # иначе теги <h3> или спецсимволы markdown исказят то, что видит бот.
-                sent = await conv.send_message(payload, parse_mode=None)
-                print(f'[richtext] отправил боту id={getattr(sent, "id", "?")}: {payload[:60]!r}')
-                if sent is not None and getattr(sent, 'id', None):
-                    _rich_skip_ids.add(sent.id)
-                resp = await conv.get_response()
-                rich = getattr(resp, 'rich_message', None)
-                print(f'[richtext] получил от бота id={resp.id}: msg={(resp.message or "")[:60]!r} entities={len(resp.entities or [])} rich_message={"есть" if rich else "нет"}')
-        finally:
-            _rich_bypass = False
-    if rich is not None:
-        rich_html = _rich_message_to_html(rich)
-        plain = _rich_message_to_plain(rich)
-        print(f'[richtext] rich_message -> html: {rich_html[:120]!r}')
-        if not rich_html.strip() and not plain.strip():
-            return None, None, None
-        return (plain or 'ㅤ'), None, rich_html
-    result_text = resp.raw_text if resp.raw_text else resp.message
-    if not result_text or not result_text.strip():
-        return None, None, None
-    return result_text, resp.entities, None
-
-
-def _prepare_bot_payload(text: str) -> str:
-    """Готовит текст к отправке боту как HTML-источник rich-message.
-
-    Бот парсит наш ввод как HTML (это видно по тому, что даже без тега
-    стиля ответ приходит обёрнутым в <p>...</p>) — поэтому спецсимволы
-    нужно экранировать, а переносы строк явно превратить в <br>, иначе
-    HTML-парсер схлопнет их в пробел и многострочное сообщение станет
-    однострочным.
-    """
-    return html.escape(text).replace('\n', '<br>')
-
-
-async def _convert_via_richbot(text: str):
-    """Отправляет текст боту (с учётом стиля .sh1/.sh2) и возвращает ответ.
-
-    Если обёрнутый тегом стиля запрос вернул пустой ответ (бот не понял
-    синтаксис тега — так и было на практике с <h3>), пробуем ещё раз
-    обычным текстом без обёртки, чтобы .sh2 не превращался в тишину.
-    """
-    bot_entity = await _get_richbot_entity()
-    safe_text = _prepare_bot_payload(text)
-    payload = f'<{_rich_style_tag}>{safe_text}</{_rich_style_tag}>' if _rich_style_tag else safe_text
-    result_text, result_entities, rich_html = await _ask_richbot(bot_entity, payload)
-    if not result_text and _rich_style_tag:
-        print(f'[richtext] пустой ответ на <{_rich_style_tag}>, повторяю без обёртки')
-        result_text, result_entities, rich_html = await _ask_richbot(bot_entity, safe_text)
-    return result_text, result_entities, rich_html
+async def _build_richtext_result(text: str):
+    """Готовит (текст, entities, rich_html) для правки сообщения — локально,
+    без похода к внешнему боту."""
+    rich_html = _build_rich_html(text, _rich_style_tag)
+    return text, None, rich_html
 
 
 @client.on(events.NewMessage(pattern=r'^\.on$', outgoing=True))
@@ -1110,7 +969,7 @@ for _sh_cmd, _sh_tag in RICH_STYLE_TAGS.items():
 
 
 async def _process_richtext(event):
-    """Переоформляет исходящий текст/подпись через @Text2RichBot, если фича включена.
+    """Переоформляет исходящий текст/подпись в rich_message, если фича включена.
 
     Общая логика для events.NewMessage (обычная отправка) и
     events.MessageEdited (некоторые клиенты Telegram при медленной
@@ -1147,29 +1006,14 @@ async def _process_richtext(event):
     media_kind = type(getattr(event.message, 'media', None)).__name__
     print(f'[richtext] обрабатываю сообщение id={event.id} chat={event.chat_id} media={media_kind} src={type(event).__qualname__}: {text[:60]!r}')
     try:
-        bot_entity = await _get_richbot_entity()
+        result_text, result_entities, rich_html = await _build_richtext_result(text)
     except Exception as e:
-        print(f'[richtext] резолв @Text2RichBot упал: {e!r}')
-        await _debug_notify('резолв @Text2RichBot', e)
-        return
-    if bot_entity is None:
-        return
-    # Переписку с самим ботом форматирования не трогаем (иначе цикл)
-    try:
-        if event.chat_id == utils.get_peer_id(bot_entity):
-            return
-    except Exception:
-        pass
-    try:
-        result_text, result_entities, rich_html = await _convert_via_richbot(text)
-    except Exception as e:
-        print(f'[richtext] запрос к боту упал: {e!r}')
-        await _debug_notify('запрос к @Text2RichBot', e)
+        print(f'[richtext] построение rich_html упало: {e!r}')
+        await _debug_notify('построение рич-текста', e)
         return
     if not result_text:
-        print('[richtext] пустой ответ бота')
         return
-    print(f'[richtext] ответ бота: {result_text[:60]!r} entities={len(result_entities or [])} rich_html={bool(rich_html)}')
+    print(f'[richtext] готово: {result_text[:60]!r} entities={len(result_entities or [])} rich_html={bool(rich_html)}')
     # Наша собственная правка тоже порождает событие MessageEdited — без
     # этого флага она бы зациклилась сама на себя через тот же обработчик.
     _rich_bypass = True
@@ -1239,118 +1083,7 @@ async def handle_richtext_edited(event):
     await _process_richtext(event)
 
 
-def _transcribe_sync(voice_bytes: bytes) -> str | None:
-    """Синхронная транскрибация через faster-whisper (запускается в executor)."""
-    if not WHISPER_AVAILABLE:
-        return None
-    model = _get_whisper_model()
-    if model is None:
-        return None
-    try:
-        # Пишем во временный файл — faster-whisper принимает путь к файлу
-        import tempfile
-        with tempfile.NamedTemporaryFile(suffix='.ogg', delete=False) as tmp:
-            tmp.write(voice_bytes)
-            tmp_path = tmp.name
-        try:
-            segments, _ = model.transcribe(
-                tmp_path,
-                language='ru',
-                beam_size=3,
-                vad_filter=True,          # фильтр тишины
-                vad_parameters={"min_silence_duration_ms": 300},
-            )
-            text = ' '.join(seg.text.strip() for seg in segments).strip()
-            return text or None
-        finally:
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
-    except Exception as e:
-        print(f'Ошибка транскрибации: {e}')
-        return None
-
-
-async def _transcribe_voice(voice_bytes: bytes) -> str | None:
-    """Запускает синхронную транскрибацию в отдельном потоке."""
-    if not WHISPER_AVAILABLE:
-        return None
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(_whisper_executor, _transcribe_sync, voice_bytes)
-
-
-@client.on(events.NewMessage(outgoing=True))
-async def handle_gs_voice(event):
-    """Автоматически транскрибирует исходящие голосовые сообщения."""
-    if event.sender_id != OWNER_ID:
-        return
-    if not gs_enabled:
-        return
-    # Проверяем, что это голосовое сообщение (voice note)
-    if not getattr(event.message, 'voice', None):
-        return
-    try:
-        voice_bytes = await event.message.download_media(file=bytes)
-        if not voice_bytes:
-            return
-        text = await _transcribe_voice(voice_bytes)
-        if not text:
-            return
-        # Лимит подписи у медиа в Telegram: 1024 символа (2048 с Premium).
-        # Режем с запасом — иначе edit голосового падает по длине (это и была
-        # причина старых ошибок EditMessageRequest на длинных гс).
-        MAX_CAP = 1000
-        clipped = text if len(text) <= MAX_CAP else text[:MAX_CAP].rstrip() + '…'
-        quote = f'<blockquote>{html.escape(clipped)}</blockquote>'
-        # Основной режим — РЕДАКТИРУЕМ само голосовое: голос остаётся, под ним
-        # появляется текст (как на скрине, с пометкой «изменено»).
-        try:
-            await event.message.edit(quote, parse_mode='html')
-        except Exception:
-            # Если Telegram всё же не дал отредактировать — не теряем
-            # расшифровку и не спамим ошибками: шлём ответом.
-            try:
-                await event.message.reply(quote, parse_mode='html')
-            except Exception:
-                await event.respond(quote, parse_mode='html')
-        gc.collect()
-    except Exception as e:
-        print(f'handle_gs_voice: {e}')
-
-
-@client.on(events.NewMessage(outgoing=True))
-async def handle_gs_text(event):
-    """«гс <текст>» → <текст> оформляется цитатой.
-
-    Триггер срабатывает ТОЛЬКО если сообщение начинается со слова «гс»:
-      «гс привет»  → цитата «привет»
-      «привет гс»  → НЕ трогаем (обычный текст)
-    """
-    if event.sender_id != OWNER_ID:
-        return
-    if not gs_enabled:
-        return
-    text = getattr(event.message, 'message', '') or ''
-    if not text:
-        return
-    if text.strip().startswith('.'):
-        return
-    # «гс» только как первое слово; дальше — отделители и сам текст.
-    m = re.match(r'^\s*гс\b[\s,:;.\-—]*(.+)$', text,
-                 flags=re.IGNORECASE | re.DOTALL)
-    if not m:
-        return
-    body = m.group(1).strip()
-    if not body:
-        return
-    quote = f'<blockquote>{html.escape(body)}</blockquote>'
-    try:
-        await event.edit(quote, parse_mode='html')
-    except Exception:
-        pass
-
-# 
+#
 # АВТОУДАЛЕНИЕ СООБЩЕНИЙ В ЧАТАХ
 # 
 
@@ -1538,55 +1271,7 @@ async def handler_del_count(event):
     except Exception:
         pass
 
-# 
-# SBAN - БАН И УДАЛЕНИЕ СООБЩЕНИЙ
-# 
-
-@client.on(events.NewMessage(outgoing=True, pattern=r'(?i)^\.sban(?:\s+(.+))?$'))
-async def sban(event):
-    """Банит пользователя и удаляет его сообщения."""
-    if event.sender_id != OWNER_ID:
-        return
-    target = None
-    target_user = None
-    try:
-        chat = await event.get_chat()
-        if event.is_reply:
-            reply = await event.get_reply_message()
-            target = getattr(reply, 'sender_id', None)
-            if target is None or target == 0:
-                await event.delete()
-                return
-            target_user = await client.get_entity(target)
-        else:
-            arg = event.pattern_match.group(1)
-            if arg:
-                arg = arg.strip()
-                if arg.lstrip('-').isdigit():
-                    target = int(arg)
-                    target_user = await client.get_entity(target)
-                else:
-                    target_user = await client.get_entity(arg)
-                    target = target_user.id
-        if not target:
-            await event.delete()
-            return
-        await event.delete()
-        rights = ChatBannedRights(until_date=None, view_messages=True)
-        ban_future = asyncio.create_task(_perform_ban(chat, target, target_user, rights))
-        asyncio.create_task(_delete_user_messages_if_needed(chat, target, ban_future))
-    except Exception as e:
-        try:
-            tb = traceback.format_exc()
-            await client.send_message(OWNER_ID, f"sban error: {e}\n\n{tb}")
-        except Exception:
-            pass
-        try:
-            await event.delete()
-        except Exception:
-            pass
-
-# 
+#
 # УПРАВЛЕНИЕ КАНАЛАМИ
 # 
 
@@ -2118,6 +1803,9 @@ async def auto_comment(event):
     """Автоматически комментирует посты в отслеживаемых каналах."""
     global monitored_channels
 
+    if not comments_enabled:
+        return
+
     chat_id = event.chat_id
     monitored_set = set(monitored_channels)
     all_ids = monitored_set | {_to_peer_id(c) for c in monitored_channels}
@@ -2163,6 +1851,9 @@ async def auto_comment(event):
                 finally:
                     _rich_bypass = False
                 _record_comment(event.chat_id)
+                if sent is not None and ff_enabled:
+                    print(f'[ff] запланировал правку msg id={sent.id} chat={sent.chat_id} через {FF_DELAY}с')
+                    asyncio.create_task(_append_ff_promo_later(sent, FF_DELAY))
                 return
             except errors.FloodWaitError as e:
                 # FloodWait: блочим этот канал на длину паузы — Telegram явно
@@ -2332,8 +2023,12 @@ async def cmd_help(event):
         "  .remove <ID/@>     убрать по ID или @username\n"
         "  .list              показать список каналов\n\n"
         "КОММЕНТАРИИ:\n"
+        "  .kn                включить автокомменты под постами\n"
+        "  .kf                выключить автокомменты\n"
         "  .clean / .clear    принудительно удалить ВСЕ мои комменты везде\n"
-        "  .clean/.clear <ID> удалить в одном канале\n\n"
+        "  .clean/.clear <ID> удалить в одном канале\n"
+        "  .ff                вкл дозапись промо-строки через 5 мин\n"
+        "  .fff               выключить\n\n"
         " УДАЛЕНИЕ СООБЩЕНИЙ:\n"
         "  .delall            удалить все мои сообщения в чате\n"
         "  .delall <ID>       удалить в другом чате\n"
@@ -2344,13 +2039,7 @@ async def cmd_help(event):
         "  .avtodel <N>h      через N часов\n"
         "  .avtodel <N>d      через N дней\n"
         "  .avtoff            отключить\n\n"
-        "БАН:\n"
-        "  .sban              (на ответ) - забанить + удалить сообщения\n"
-        "  .sban <ID/@>       забанить по ID или ник\n\n"
-        "ТРАНСКРИБАЦИЯ ГОЛОСОВЫХ:\n"
-        "  .gn                включить (авто для всех гс)\n"
-        "  .gf                выключить\n\n"
-        "РИЧ-ТЕКСТ (через @Text2RichBot):\n"
+        "РИЧ-ТЕКСТ:\n"
         "  .on                включить авто-конвертацию твоих сообщений\n"
         "  .off               выключить\n"
         "  .sh1               обычный (без обёртки)\n"
@@ -2392,11 +2081,13 @@ async def main():
     # Загрузка каналов
     monitored_channels = load_channels()
     print(f'Загружено {len(monitored_channels)} каналов')
-    
+
     # Загрузка состояния автокика
     await load_kick_state()
     print(f' Состояние автокика: {"ВКЛ" if kick_enabled else "ВЫКЛ"}')
+    print(f' Автокомменты: {"ВКЛ" if comments_enabled else "ВЫКЛ"}')
     print(f' Рич-текст: {"ВКЛ" if richtext_enabled else "ВЫКЛ"}')
+    print(f' Промо-дозапись (.ff): {"ВКЛ" if ff_enabled else "ВЫКЛ"}')
 
     # Запуск фоновой задачи автоочистки
     autoclean_task = asyncio.create_task(autoclean_loop())
@@ -2407,7 +2098,13 @@ async def main():
     if kick_enabled:
         monitor_task = asyncio.create_task(monitor_sessions())
         print('Автокик перезапущен')
-    
+
+    # .t — восстановление таймера в нике после перезапуска, если был включён
+    global time_nick_task
+    if time_nick_enabled:
+        time_nick_task = asyncio.create_task(_time_nick_loop())
+        print('Время в нике восстановлено (было включено)')
+
     print('Юзербот готов!')
     print(f'Владелец: {OWNER_ID}')
     print('-' * 40)

@@ -9,6 +9,7 @@ session.session*
 # Состояние рантайма
 kick_state.json
 autoclean_state.json
+time_nick_state.json
 
 # Python
 __pycache__/
@@ -19,3 +20,4 @@ venv/
 .channels-backup.json
 .render-service.json
 
+DEPLOY_NOTES.md
