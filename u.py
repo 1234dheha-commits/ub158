@@ -194,7 +194,11 @@ comments_enabled = True
 # Дозапись промо-строки к автокомментарию через 5 минут после отправки (.ff / .fff)
 ff_enabled = False
 FF_DELAY = 5 * 60
-FF_PROMO_TEXT = 'скрытые гифты можно смотреть тут musikappbot'
+# Дописывается одна из двух строк случайно (см. _append_ff_promo_later)
+FF_PROMO_TEXTS = [
+    'скрытые гифты можно смотреть тут musikappbot',
+    'это лучший андроид клиент snowgram_releases',
+]
 baseline_hashes = set()
 monitor_task = None
 
@@ -605,15 +609,17 @@ async def _delete_later(messages, delay):
                 pass
 
 async def _append_ff_promo_later(message, delay):
-    """Дописывает промо-строку к автокомментарию через delay секунд (.ff/.fff)."""
+    """Дописывает промо-строку (одну из двух, случайно) к автокомментарию
+    через delay секунд (.ff/.fff)."""
     await asyncio.sleep(delay)
     if not ff_enabled:
         print(f'[ff] пропуск правки msg id={message.id}: .ff выключен')
         return
     try:
         current_text = getattr(message, 'message', None) or ''
-        await message.edit(f'{current_text}\n{FF_PROMO_TEXT}')
-        print(f'[ff] дописал промо к msg id={message.id} chat={message.chat_id}')
+        promo = random.choice(FF_PROMO_TEXTS)
+        await message.edit(f'{current_text}\n{promo}')
+        print(f'[ff] дописал промо к msg id={message.id} chat={message.chat_id}: "{promo}"')
     except errors.MessageNotModifiedError:
         print(f'[ff] msg id={message.id}: MessageNotModifiedError (уже с этим текстом?)')
     except Exception as e:
