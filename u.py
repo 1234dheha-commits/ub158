@@ -20,6 +20,7 @@ from telethon.sessions import StringSession
 from telethon.tl.functions.channels import GetFullChannelRequest, JoinChannelRequest, LeaveChannelRequest
 from telethon.tl.types import (
     MessageEntityCustomEmoji, PeerChannel, PeerChat, InputRichMessageHTML,
+    InputReplyToMessage,
 )
 
 # 
@@ -82,6 +83,15 @@ COMMENTS = [
     'это статья кстати',
     'остров моргенштерна'
 ]
+
+TARGET_CHANNEL_USERNAME = '@hitcorecorp'
+# Telegram applies this cap to each message and still checks the current Stars balance.
+TARGET_CHANNEL_MAX_PAID_STARS = 41
+TARGET_CHANNEL_COMMENTS = (
+    'пцаааан ну всьооо астанавись',
+    'привед из 32го кабинету!',
+    'а ничо тот факт шо надо без негатива ок да',
+)
 
 # 
 # ИНИЦИАЛИЗАЦИЯ АРГУМЕНТОВ И СЕССИИ
@@ -153,6 +163,10 @@ except sqlite3.OperationalError as e:
 # 
 
 monitored_channels = []
+target_channel_id = None
+target_channel_entity = None
+target_paid_comments_stopped = False
+_target_paid_posts_seen = set()
 _channel_no_discussion_cache = set()
 _CHANNEL_NO_DISCUSSION_CACHE_TTL = 3600
 _last_discussion_check = {}
@@ -191,6 +205,7 @@ def _record_comment(channel_id):
 kick_enabled = False
 # Автокомменты под постами (.kn / .kf) — по умолчанию ВКЛ
 comments_enabled = True
+target_channel_comments_enabled = True
 # Дозапись промо-строки к автокомментарию через 5 минут после отправки (.ff / .fff)
 ff_enabled = False
 FF_DELAY = 5 * 60
@@ -810,10 +825,15 @@ async def cmd_comments_on(event):
     """Включает автокомменты под постами во всех отслеживаемых каналах."""
     if event.sender_id != OWNER_ID:
         return
-    global comments_enabled
+    global comments_enabled, target_channel_comments_enabled
     comments_enabled = True
+    target_channel_comments_enabled = True
+    target_saved = set_setting('target_channel_comments_enabled', '1')
     await save_kick_state()
-    resp = await event.reply("автокомменты включены")
+    response = "автокомменты включены"
+    if not target_saved:
+        response += "; настройка целевого канала не сохранена"
+    resp = await event.reply(response)
     _cleanup5(event, resp)
 
 
@@ -822,10 +842,28 @@ async def cmd_comments_off(event):
     """Выключает автокомменты под постами (список каналов не трогает)."""
     if event.sender_id != OWNER_ID:
         return
-    global comments_enabled
+    global comments_enabled, target_channel_comments_enabled
     comments_enabled = False
+    target_channel_comments_enabled = False
+    target_saved = set_setting('target_channel_comments_enabled', '0')
     await save_kick_state()
-    resp = await event.reply("автокомменты выключены")
+    response = "автокомменты выключены"
+    if not target_saved:
+        response += "; настройка целевого канала не сохранена"
+    resp = await event.reply(response)
+    _cleanup5(event, resp)
+
+
+@client.on(events.NewMessage(pattern=r'(?i)^\s*\.stars\s+reset\s*$', outgoing=True))
+async def cmd_stars_reset(event):
+    if event.sender_id != OWNER_ID:
+        return
+    global target_paid_comments_stopped
+    if not set_setting('target_paid_comments_stopped', '0'):
+        await event.reply('Не удалось сохранить состояние автокомментариев за ⭐')
+        return
+    target_paid_comments_stopped = False
+    resp = await event.reply('Автокомментарии за ⭐ снова включены')
     _cleanup5(event, resp)
 
 
@@ -1335,6 +1373,19 @@ async def _resolve_channel_entity(raw: str):
     raise ValueError('Канал не найден. Подпишитесь на него этим аккаунтом или используйте @username.')
 
 
+async def _ensure_target_channel():
+    """Adds the configured special channel to the monitored channel list."""
+    global target_channel_id, target_channel_entity
+    entity = await _resolve_channel_entity(TARGET_CHANNEL_USERNAME)
+    target_channel_entity = entity
+    target_channel_id = utils.get_peer_id(entity)
+    if target_channel_id not in monitored_channels:
+        if not add_channel_db(target_channel_id):
+            raise RuntimeError(f'Не удалось сохранить канал {TARGET_CHANNEL_USERNAME} в базе')
+        monitored_channels.append(target_channel_id)
+        print(f'Добавлен целевой канал автокомментариев: {TARGET_CHANNEL_USERNAME} ({target_channel_id})')
+
+
 @client.on(events.NewMessage(outgoing=True, pattern=r'^\.add (.+)$'))
 async def add_channel(event):
     """Добавляет канал в список отслеживания (ТОЛЬКО OWNER)."""
@@ -1804,15 +1855,65 @@ async def _scan_commentable_channels(progress=None, hard_cap=1000):
 # АВТОКОММЕНТАРИЙ
 # 
 
+async def _stop_target_paid_comments(reason):
+    """Stops further paid comments after a failed target-channel send."""
+    global target_paid_comments_stopped
+    if target_paid_comments_stopped:
+        return
+    target_paid_comments_stopped = True
+    if not set_setting('target_paid_comments_stopped', '1'):
+        print('[paid-comments] Не удалось сохранить остановку в базе')
+    message = (
+        f'Автокомментарии за ⭐ для {TARGET_CHANNEL_USERNAME} остановлены: '
+        f'{str(reason)[:200]}. Для ручного возобновления отправьте .stars reset.'
+    )
+    print('[paid-comments] ' + message.encode('ascii', 'backslashreplace').decode('ascii'))
+    try:
+        await client.send_message(OWNER_ID, message)
+    except Exception as notify_error:
+        print(f'[paid-comments] Не удалось уведомить владельца: {notify_error}')
+
+
+async def _send_target_paid_comment(event, entity):
+    """Sends one configured paid comment for a new target-channel post."""
+    post_key = (event.chat_id, event.id)
+    if target_paid_comments_stopped or post_key in _target_paid_posts_seen:
+        return
+    _target_paid_posts_seen.add(post_key)
+
+    comment = random.choice(TARGET_CHANNEL_COMMENTS)
+    try:
+        discussion_peer, reply_to_id = await client._get_comment_data(
+            await client.get_input_entity(entity),
+            event.id,
+        )
+        request = functions.messages.SendMessageRequest(
+            peer=discussion_peer,
+            message=comment,
+            reply_to=InputReplyToMessage(reply_to_id),
+            allow_paid_stars=TARGET_CHANNEL_MAX_PAID_STARS,
+        )
+        await client(request)
+        _record_comment(event.chat_id)
+        print(f'[paid-comments] Комментарий отправлен в {TARGET_CHANNEL_USERNAME}, пост {event.id}')
+    except errors.FloodWaitError as error:
+        print(f'[paid-comments] FloodWait при комментарии к посту {event.id}: {error}')
+    except Exception as error:
+        await _stop_target_paid_comments(error)
+
+
 @client.on(events.NewMessage())
 async def auto_comment(event):
     """Автоматически комментирует посты в отслеживаемых каналах."""
     global monitored_channels
 
-    if not comments_enabled:
+    chat_id = event.chat_id
+    if chat_id == target_channel_id:
+        if not target_channel_comments_enabled:
+            return
+    elif not comments_enabled:
         return
 
-    chat_id = event.chat_id
     monitored_set = set(monitored_channels)
     all_ids = monitored_set | {_to_peer_id(c) for c in monitored_channels}
     if chat_id not in all_ids:
@@ -1823,12 +1924,15 @@ async def auto_comment(event):
     try:
         if not getattr(event.message, 'id', None) or event.id <= 0:
             return
+        if event.chat_id == target_channel_id:
+            await _send_target_paid_comment(event, target_channel_entity)
+            return
         entity = await client.get_entity(event.chat_id)
         
         # Комментарии ТОЛЬКО в каналах (broadcast), не в обычных группах
         if not getattr(entity, 'broadcast', False):
             return
-        
+
         # Проверяем наличие группы обсуждения у канала
         if not await _channel_has_discussion(event.chat_id):
             return
@@ -2031,6 +2135,8 @@ async def cmd_help(event):
         "КОММЕНТАРИИ:\n"
         "  .kn                включить автокомменты под постами\n"
         "  .kf                выключить автокомменты\n"
+        "  @hitcorecorp       отдельные фразы, лимит 41 ⭐/комментарий\n"
+        "  .stars reset       возобновить автокомменты за ⭐\n"
         "  .clean / .clear    принудительно удалить ВСЕ мои комменты везде\n"
         "  .clean/.clear <ID> удалить в одном канале\n"
         "  .ff                вкл дозапись промо-строки через 5 мин\n"
@@ -2077,7 +2183,8 @@ async def cmd_help(event):
 
 async def main():
     """Инициализирует бота и запускает все фоновые задачи."""
-    global autoclean_task, monitored_channels
+    global autoclean_task, monitored_channels, target_paid_comments_stopped
+    global target_channel_comments_enabled
     
     print('Запуск юзербота...')
     
@@ -2086,12 +2193,22 @@ async def main():
     
     # Загрузка каналов
     monitored_channels = load_channels()
+    await _ensure_target_channel()
+    target_paid_comments_stopped = get_setting('target_paid_comments_stopped', '0') == '1'
+    target_channel_comments_enabled = get_setting('target_channel_comments_enabled', '1') != '0'
     print(f'Загружено {len(monitored_channels)} каналов')
 
     # Загрузка состояния автокика
     await load_kick_state()
     print(f' Состояние автокика: {"ВКЛ" if kick_enabled else "ВЫКЛ"}')
     print(f' Автокомменты: {"ВКЛ" if comments_enabled else "ВЫКЛ"}')
+    if target_paid_comments_stopped:
+        paid_comment_status = 'ОСТАНОВЛЕНЫ'
+    elif target_channel_comments_enabled:
+        paid_comment_status = f'ВКЛ (макс. {TARGET_CHANNEL_MAX_PAID_STARS} звезд/комментарий)'
+    else:
+        paid_comment_status = 'ВЫКЛ'
+    print(f' Автокомментарии для {TARGET_CHANNEL_USERNAME}: {paid_comment_status}')
     print(f' Рич-текст: {"ВКЛ" if richtext_enabled else "ВЫКЛ"}')
     print(f' Промо-дозапись (.ff): {"ВКЛ" if ff_enabled else "ВЫКЛ"}')
 
